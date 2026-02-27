@@ -197,14 +197,17 @@ def _generate_all_predictions(data, todays_games_uo, frame_ml):
     # --- Combinar ML: weighted average ---
     ml_probs = W_XGB_ML * xgb_ml_probs + W_CAT_ML * cat_ml_probs
 
-    # --- O/U: XGBoost solo ---
-    frame_uo = frame_ml.copy()
-    frame_uo["OU"] = np.asarray(todays_games_uo, dtype=float)
-    ou_probs = XGBoost_Runner._predict_probs(
-        XGBoost_Runner.xgb_uo,
-        frame_uo.values.astype(float),
-        XGBoost_Runner.xgb_uo_calibrator,
-    )
+    # --- O/U: XGBoost solo (opcional) ---
+    if XGBoost_Runner.xgb_uo is not None:
+        frame_uo = frame_ml.copy()
+        frame_uo["OU"] = np.asarray(todays_games_uo, dtype=float)
+        ou_probs = XGBoost_Runner._predict_probs(
+            XGBoost_Runner.xgb_uo,
+            frame_uo.values.astype(float),
+            XGBoost_Runner.xgb_uo_calibrator,
+        )
+    else:
+        ou_probs = np.full((len(todays_games_uo), 2), 0.5)
 
     return ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs
 
@@ -329,11 +332,21 @@ def _print_ah_section(games, ml_probs, spread_home_odds, spread_away_odds, marke
                   f"REG: μ={mu_reg:+.1f} P(cover)={p_cover_reg:.1%}")
 
 
-def _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_flag, sigmas=None):
+def _is_underdog_trap(prob, ev):
+    """Detecta EV+ en underdog con prob < 35% — empiricamente nunca se da."""
+    return prob < 0.35 and ev > 0
+
+def _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_flag,
+                         sigmas=None, market_info=None, spread_home_odds=None, spread_away_odds=None):
     """Muestra Expected Value y opcionalmente Kelly Criterion por partido.
 
     Si sigmas esta disponible, usa robust_kelly(epsilon=sigma) en vez de eighth_kelly.
+    Detecta underdog traps (EV+ con prob < 35%) y sugiere AH del favorito.
     """
+    if market_info is None:
+        market_info = {}
+    spreads = market_info.get("MARKET_SPREAD", np.zeros(len(games)))
+
     if kelly_flag:
         label = "Expected Value & Robust Kelly (σ-adaptive)" if sigmas is not None else "Expected Value & Kelly Criterion"
         print(f"------------{label}-----------")
@@ -358,6 +371,7 @@ def _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_f
             bankroll_home = f" Bankroll (DRO-Kelly, σ={sigma_i:.3f}): {kelly_home}%"
             bankroll_away = f" Bankroll (DRO-Kelly, σ={sigma_i:.3f}): {kelly_away}%"
         else:
+            sigma_i = 0.05
             bankroll_home = (
                 f" Bankroll (\u215b-Kelly, cap 2.5%): "
                 f"{kc.calculate_eighth_kelly(home_team_odds[idx], ml_probs[idx][1])}%"
@@ -366,14 +380,54 @@ def _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_f
                 f" Bankroll (\u215b-Kelly, cap 2.5%): "
                 f"{kc.calculate_eighth_kelly(away_team_odds[idx], ml_probs[idx][0])}%"
             )
+
+        # --- Underdog trap detection ---
+        trap_home = _is_underdog_trap(ml_probs[idx][1], ev_home)
+        trap_away = _is_underdog_trap(ml_probs[idx][0], ev_away)
+
+        home_tag = f"  {Fore.YELLOW}TRAP{Style.RESET_ALL}" if trap_home else ""
+        away_tag = f"  {Fore.YELLOW}TRAP{Style.RESET_ALL}" if trap_away else ""
+
         print(
             f"{home_team} EV: {ev_colors['home']}{ev_home}{Style.RESET_ALL}"
-            f"{bankroll_home if kelly_flag else ''}"
+            f"{bankroll_home if kelly_flag else ''}{home_tag}"
         )
         print(
             f"{away_team} EV: {ev_colors['away']}{ev_away}{Style.RESET_ALL}"
-            f"{bankroll_away if kelly_flag else ''}"
+            f"{bankroll_away if kelly_flag else ''}{away_tag}"
         )
+
+        # --- AH redirect: cuando hay trap, mostrar AH del favorito ---
+        if trap_home or trap_away:
+            line = float(spreads[idx])
+            # El favorito es el lado opuesto al trap
+            if trap_away:
+                # away es underdog trap → favorito es home
+                fav_team = home_team
+                fav_prob = float(ml_probs[idx][1])
+                fav_ah = ah_probabilities(fav_prob, line)
+                sh = int(spread_home_odds[idx]) if spread_home_odds and spread_home_odds[idx] else -110
+                fav_ev = float(ah_expected_value(fav_ah, sh))
+                fav_p = fav_ah["p_full_win"] + fav_ah["p_half_win"]
+                fav_kelly = float(calculate_robust_kelly_simple(sh, fav_p, epsilon=sigma_i))
+                fav_line = f"{line:+.1f}"
+            else:
+                # home es underdog trap → favorito es away
+                fav_team = away_team
+                fav_prob = float(ml_probs[idx][0])
+                fav_ah = ah_probabilities(fav_prob, -line)
+                sa = int(spread_away_odds[idx]) if spread_away_odds and spread_away_odds[idx] else -110
+                fav_ev = float(ah_expected_value(fav_ah, sa))
+                fav_p = fav_ah["p_full_win"] + fav_ah["p_half_win"]
+                fav_kelly = float(calculate_robust_kelly_simple(sa, fav_p, epsilon=sigma_i))
+                fav_line = f"{-line:+.1f}"
+
+            ev_color = Fore.GREEN if fav_ev > 0 else Fore.RED
+            print(
+                f"    {Fore.CYAN}-> AH {fav_team} ({fav_line}): "
+                f"P={fav_p:.1%} EV={ev_color}{fav_ev:+.1f}{Style.RESET_ALL} "
+                f"Kelly={fav_kelly:.2f}%{Style.RESET_ALL}"
+            )
 
 
 def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_team_odds,
@@ -439,6 +493,10 @@ def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_t
         # Sigma (varianza per-game)
         if sigma_i is not None:
             entry["sigma"] = sigma_i
+
+        # --- Underdog trap flags ---
+        entry["trap_home"] = _is_underdog_trap(ml_probs[idx][1], entry["ev_home"])
+        entry["trap_away"] = _is_underdog_trap(ml_probs[idx][0], entry["ev_away"])
 
         # --- Asian Handicap (Spread) ---
         line = float(spreads[idx])
@@ -544,7 +602,8 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
         print(f"  Sigma: mean={sigmas.mean():.3f}, range=[{sigmas.min():.3f}, {sigmas.max():.3f}]"
               f" → Kelly adaptativo (DRO)\n")
 
-    _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_criterion, sigmas)
+    _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_criterion, sigmas,
+                         market_info, spread_home_odds, spread_away_odds)
 
     # --- Asian Handicap (spread) ---
     _print_ah_section(games, ml_probs, spread_home_odds, spread_away_odds, market_info, sigmas, reg_margins)
