@@ -348,6 +348,24 @@ def _print_period_update(
     print(f"  (detalle: {expl})")
     print(f"{'=' * 65}")
 
+    # --- Persist to CSV tracker ---
+    try:
+        from src.core.betting.live_tracker import log_adjustment
+        method = "logistic" if "[logistic" in expl else "simple"
+        log_adjustment(
+            home_team=home,
+            away_team=away,
+            quarter=period,
+            home_score=home_score,
+            away_score=away_score,
+            p_pregame=p_pre,
+            p_adjusted=p_adj,
+            conf_set_size=conf_set,
+            method=method,
+        )
+    except Exception as e:
+        logger.debug("Live tracker write failed: %s", e)
+
     return p_adj
 
 
