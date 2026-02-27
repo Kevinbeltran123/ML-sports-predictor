@@ -1,0 +1,12 @@
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn>=1.8.0
+xgboost==2.1.4
+catboost
+optuna>=4.0.0
+requests>=2.32.0
+nba_api==1.11.3
+python-dotenv>=1.0.0
+joblib
+toml
+colorama
