@@ -212,222 +212,234 @@ def _generate_all_predictions(data, todays_games_uo, frame_ml):
     return ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs
 
 
-def _print_game_predictions(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
-                            todays_games_uo, conformal_set_sizes=None, conformal_margins=None,
-                            sigmas=None):
-    """Muestra prediccion de ganador y O/U para cada partido."""
+def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
+                       todays_games_uo, home_team_odds, away_team_odds,
+                       kelly_flag, market_info, spread_home_odds, spread_away_odds,
+                       conformal_set_sizes=None, conformal_margins=None,
+                       sigmas=None, reg_margins=None):
+    """Construye bloques de output por partido con toda la info consolidada.
+
+    Retorna lista de dicts con datos pre-calculados, rankeados por max EV descendente.
+    """
+    spreads = market_info.get("MARKET_SPREAD", np.zeros(len(games)))
+    blocks = []
+
     for idx, (home_team, away_team) in enumerate(games):
+        b = {"idx": idx, "home": home_team, "away": away_team}
+
+        # --- ML pick ---
         winner = int(np.argmax(ml_probs[idx]))
+        b["winner"] = winner
+        b["pick"] = home_team if winner == 1 else away_team
+        b["pick_prob"] = float(ml_probs[idx][winner])
+        b["xgb_agree"] = int(np.argmax(xgb_ml_probs[idx])) == int(np.argmax(cat_ml_probs[idx]))
+        b["xgb_conf"] = round(xgb_ml_probs[idx][winner] * 100, 1)
+        b["cat_conf"] = round(cat_ml_probs[idx][winner] * 100, 1)
+
+        # --- O/U ---
         under_over = int(np.argmax(ou_probs[idx]))
-        winner_confidence = round(ml_probs[idx][winner] * 100, 1)
-        ou_confidence = round(ou_probs[idx][under_over] * 100, 1)
+        b["ou_label"] = "OVER" if under_over == 1 else "UNDER"
+        b["ou_line"] = todays_games_uo[idx]
+        b["ou_conf"] = round(ou_probs[idx][under_over] * 100, 1)
 
-        xgb_winner = int(np.argmax(xgb_ml_probs[idx]))
-        cat_winner = int(np.argmax(cat_ml_probs[idx]))
-        xgb_conf = round(xgb_ml_probs[idx][winner] * 100, 1)
-        cat_conf = round(cat_ml_probs[idx][winner] * 100, 1)
+        # --- EV + Kelly (ML) ---
+        ev_home = ev_away = 0.0
+        kelly_h = kelly_a = 0.0
+        sigma_i = float(sigmas[idx]) if sigmas is not None else 0.05
+        b["sigma"] = sigma_i
 
-        winner_team = home_team if winner == 1 else away_team
-        loser_team = away_team if winner == 1 else home_team
-        winner_color = Fore.GREEN if winner == 1 else Fore.RED
-        loser_color = Fore.RED if winner == 1 else Fore.GREEN
-        ou_label = "UNDER" if under_over == 0 else "OVER"
-        ou_color = Fore.MAGENTA if under_over == 0 else Fore.BLUE
-        # "+" si ambos modelos coinciden, "~" si discrepan
-        agree = "+" if xgb_winner == cat_winner else "~"
+        if home_team_odds[idx] and away_team_odds[idx]:
+            h_odds = int(home_team_odds[idx])
+            a_odds = int(away_team_odds[idx])
+            ev_home = float(Expected_Value.expected_value(ml_probs[idx][1], h_odds))
+            ev_away = float(Expected_Value.expected_value(ml_probs[idx][0], a_odds))
+            if sigmas is not None:
+                kelly_h = float(calculate_robust_kelly_simple(h_odds, ml_probs[idx][1], epsilon=sigma_i))
+                kelly_a = float(calculate_robust_kelly_simple(a_odds, ml_probs[idx][0], epsilon=sigma_i))
+            elif kelly_flag:
+                kelly_h = float(kc.calculate_eighth_kelly(h_odds, ml_probs[idx][1]))
+                kelly_a = float(kc.calculate_eighth_kelly(a_odds, ml_probs[idx][0]))
 
-        # Indicador conformal: BET si set_size=1, SKIP si set_size!=1
-        conf_tag = ""
+        b["ev_home"] = ev_home
+        b["ev_away"] = ev_away
+        b["kelly_home"] = kelly_h
+        b["kelly_away"] = kelly_a
+        b["max_ev"] = max(ev_home, ev_away)
+
+        # --- Traps ---
+        b["trap_home"] = _is_underdog_trap(ml_probs[idx][1], ev_home)
+        b["trap_away"] = _is_underdog_trap(ml_probs[idx][0], ev_away)
+
+        # --- Conformal ---
         if conformal_set_sizes is not None:
             ss = int(conformal_set_sizes[idx])
             margin = float(conformal_margins[idx]) if conformal_margins is not None else 0.0
-            if ss == 1:
-                conf_tag = f"  {Fore.GREEN}BET{Style.RESET_ALL} m={margin:.2f}"
-            else:
-                conf_tag = f"  {Fore.YELLOW}SKIP{Style.RESET_ALL} s={ss}"
+            b["conf_ss"] = ss
+            b["conf_margin"] = margin
+        else:
+            b["conf_ss"] = None
 
-        # Indicador sigma (varianza per-game)
-        sigma_tag = ""
-        if sigmas is not None:
-            s = float(sigmas[idx])
-            sigma_color = Fore.GREEN if s < 0.07 else (Fore.YELLOW if s < 0.10 else Fore.RED)
-            sigma_tag = f"  {sigma_color}σ={s:.3f}{Style.RESET_ALL}"
-
-        print(
-            f"{winner_color}{winner_team}{Style.RESET_ALL}"
-            f"{Fore.CYAN} ({winner_confidence}%){Style.RESET_ALL}"
-            f" vs {loser_color}{loser_team}{Style.RESET_ALL}: "
-            f"{ou_color}{ou_label} {Style.RESET_ALL}{todays_games_uo[idx]}"
-            f"{Fore.CYAN} ({ou_confidence}%){Style.RESET_ALL}"
-            f"  [{agree} XGB:{xgb_conf}% Cat:{cat_conf}%]"
-            f"{conf_tag}{sigma_tag}"
-        )
-
-
-def _print_ah_section(games, ml_probs, spread_home_odds, spread_away_odds, market_info, sigmas=None, reg_margins=None):
-    """Muestra predicciones de Asian Handicap (spread) por partido."""
-    spreads = market_info.get("MARKET_SPREAD", np.zeros(len(games)))
-    print(f"\n{Fore.CYAN}------------- Asian Handicap (Spread) ---------------{Style.RESET_ALL}")
-    for idx, (home_team, away_team) in enumerate(games):
+        # --- AH (spread) ---
         line = float(spreads[idx])
         prob_home = float(ml_probs[idx][1])
-        margin = expected_margin(prob_home)
+        b["spread"] = line
+        b["margin"] = expected_margin(prob_home)
 
         sh_odds = int(spread_home_odds[idx]) if spread_home_odds and spread_home_odds[idx] else -110
         sa_odds = int(spread_away_odds[idx]) if spread_away_odds and spread_away_odds[idx] else -110
 
-        # Settlement completo con quarter lines
         home_ah = ah_probabilities(prob_home, line)
         away_ah = ah_probabilities(1.0 - prob_home, -line)
-        ev_home = float(ah_expected_value(home_ah, sh_odds))
-        ev_away = float(ah_expected_value(away_ah, sa_odds))
 
-        eps = float(sigmas[idx]) if sigmas is not None else 0.05
-        p_home_profit = home_ah["p_full_win"] + home_ah["p_half_win"]
-        p_away_profit = away_ah["p_full_win"] + away_ah["p_half_win"]
-        kelly_home = float(calculate_robust_kelly_simple(sh_odds, p_home_profit, epsilon=eps))
-        kelly_away = float(calculate_robust_kelly_simple(sa_odds, p_away_profit, epsilon=eps))
+        ah_ev_home = float(ah_expected_value(home_ah, sh_odds))
+        ah_ev_away = float(ah_expected_value(away_ah, sa_odds))
+        p_home_cover = home_ah["p_full_win"] + home_ah["p_half_win"]
+        p_away_cover = away_ah["p_full_win"] + away_ah["p_half_win"]
+        ah_kelly_home = float(calculate_robust_kelly_simple(sh_odds, p_home_cover, epsilon=sigma_i))
+        ah_kelly_away = float(calculate_robust_kelly_simple(sa_odds, p_away_cover, epsilon=sigma_i))
 
-        # Tag para quarter lines
-        q_tag = " Q" if home_ah["is_quarter"] else ""
-
-        # Determinar mejor lado
-        if ev_home > ev_away and ev_home > 0:
-            best_side = "HOME"
-            best_color = Fore.GREEN
-            best_ev = ev_home
-            best_kelly = kelly_home
-            best_p = p_home_profit
-            best_line = f"{line:+.1f}"
-        elif ev_away > 0:
-            best_side = "AWAY"
-            best_color = Fore.GREEN
-            best_ev = ev_away
-            best_kelly = kelly_away
-            best_p = p_away_profit
-            best_line = f"{-line:+.1f}"
+        if ah_ev_home > ah_ev_away and ah_ev_home > 0:
+            b["ah_side"] = home_team
+            b["ah_line"] = f"{line:+.1f}"
+            b["ah_ev"] = ah_ev_home
+            b["ah_p"] = p_home_cover
+            b["ah_kelly"] = ah_kelly_home
+        elif ah_ev_away > 0:
+            b["ah_side"] = away_team
+            b["ah_line"] = f"{-line:+.1f}"
+            b["ah_ev"] = ah_ev_away
+            b["ah_p"] = p_away_cover
+            b["ah_kelly"] = ah_kelly_away
         else:
-            best_side = "---"
-            best_color = Fore.YELLOW
-            best_ev = max(ev_home, ev_away)
-            best_kelly = 0.0
-            best_p = max(p_home_profit, p_away_profit)
-            best_line = f"{line:+.1f}"
+            b["ah_side"] = None
+            b["ah_ev"] = max(ah_ev_home, ah_ev_away)
+            b["ah_p"] = max(p_home_cover, p_away_cover)
+            b["ah_kelly"] = 0.0
+            b["ah_line"] = f"{line:+.1f}"
 
-        team_label = home_team if best_side == "HOME" else away_team if best_side == "AWAY" else "ninguno"
-        print(
-            f"  {home_team} vs {away_team}: "
-            f"spread {line:+.1f}, margin {margin:+.1f}{q_tag}  "
-            f"{best_color}{best_side}{Style.RESET_ALL} "
-            f"({team_label} {best_line}) "
-            f"P={best_p:.1%} EV={best_ev:+.1f} Kelly={best_kelly:.2f}%"
-        )
+        b["ah_is_quarter"] = home_ah["is_quarter"]
 
-        # Comparación con margen del regresor (si disponible)
+        # --- Margin regression ---
         if reg_margins is not None:
             mu_reg = float(reg_margins[idx])
-            p_cover_reg = p_cover_regression(mu_reg, line)
-            p_cover_clf = home_ah["p_full_win"] + home_ah["p_half_win"]
-            print(f"    CLF: μ={margin:+.1f} P(cover)={p_cover_clf:.1%}  |  "
-                  f"REG: μ={mu_reg:+.1f} P(cover)={p_cover_reg:.1%}")
+            b["reg_margin"] = mu_reg
+            b["reg_p_cover"] = p_cover_regression(mu_reg, line)
+        else:
+            b["reg_margin"] = None
+
+        blocks.append(b)
+
+    # Rankear por max EV descendente
+    blocks.sort(key=lambda x: x["max_ev"], reverse=True)
+    return blocks
+
+
+def _print_compact_output(blocks, kelly_flag, conformal=None, has_sigma=False):
+    """Imprime bloques compactos por partido, rankeados por EV."""
+    # Header
+    n_total = len(blocks)
+    n_bet = sum(1 for b in blocks if b["conf_ss"] == 1) if blocks[0]["conf_ss"] is not None else n_total
+    sigma_label = " | DRO-Kelly" if has_sigma else ""
+    conf_label = f" | Conformal {n_bet}/{n_total}" if blocks[0]["conf_ss"] is not None else ""
+    print(f"\n{Fore.CYAN}{'='*60}")
+    print(f"  PICKS ranked by EV{conf_label}{sigma_label}")
+    print(f"{'='*60}{Style.RESET_ALL}\n")
+
+    for rank, b in enumerate(blocks, 1):
+        # --- Status tag: BET / SKIP / TRAP ---
+        has_trap = b["trap_home"] or b["trap_away"]
+        if has_trap:
+            tag = f"{Fore.YELLOW}TRAP{Style.RESET_ALL}"
+        elif b["conf_ss"] is not None and b["conf_ss"] != 1:
+            tag = f"{Fore.YELLOW}SKIP{Style.RESET_ALL}"
+        elif b["max_ev"] > 0:
+            tag = f"{Fore.GREEN}BET{Style.RESET_ALL}"
+        else:
+            tag = f"{Fore.RED}PASS{Style.RESET_ALL}"
+
+        # --- Sigma color ---
+        s = b["sigma"]
+        sigma_color = Fore.GREEN if s < 0.07 else (Fore.YELLOW if s < 0.10 else Fore.RED)
+
+        # --- Agreement ---
+        agree = "+" if b["xgb_agree"] else "~"
+
+        # --- Line 1: pick + confidence + tag ---
+        pick_color = Fore.GREEN if b["winner"] == 1 else Fore.RED
+        loser = b["away"] if b["winner"] == 1 else b["home"]
+        loser_color = Fore.RED if b["winner"] == 1 else Fore.GREEN
+        print(
+            f"  {Fore.CYAN}#{rank}{Style.RESET_ALL}  "
+            f"{pick_color}{b['pick']}{Style.RESET_ALL} "
+            f"({b['pick_prob']*100:.1f}%) vs "
+            f"{loser_color}{loser}{Style.RESET_ALL}  "
+            f"[{tag}]"
+        )
+
+        # --- Line 2: ML EV + Kelly + models ---
+        ev_best_side = "home" if b["ev_home"] >= b["ev_away"] else "away"
+        ev_val = b[f"ev_{ev_best_side}"]
+        kelly_val = b[f"kelly_{ev_best_side}"]
+        ev_color = Fore.GREEN if ev_val > 0 else Fore.RED
+        ev_team = b["home"] if ev_best_side == "home" else b["away"]
+        kelly_str = f"  Kelly={kelly_val:.2f}%" if kelly_flag else ""
+        print(
+            f"       ML  {ev_team}: EV={ev_color}{ev_val:+.1f}{Style.RESET_ALL}{kelly_str}"
+            f"  [{agree} XGB:{b['xgb_conf']}% Cat:{b['cat_conf']}%]"
+            f"  {sigma_color}σ={s:.3f}{Style.RESET_ALL}"
+        )
+
+        # --- Line 3: AH ---
+        if b["ah_side"]:
+            ah_ev_color = Fore.GREEN if b["ah_ev"] > 0 else Fore.RED
+            q_tag = " Q" if b["ah_is_quarter"] else ""
+            print(
+                f"       AH  {b['ah_side']} ({b['ah_line']}{q_tag}): "
+                f"P={b['ah_p']:.1%} EV={ah_ev_color}{b['ah_ev']:+.1f}{Style.RESET_ALL} "
+                f"Kelly={b['ah_kelly']:.2f}%"
+                f"  margin={b['margin']:+.1f}"
+            )
+        else:
+            print(
+                f"       AH  --- spread {b['ah_line']}, margin={b['margin']:+.1f}"
+                f"  EV={b['ah_ev']:+.1f}"
+            )
+
+        # --- Line 3b: Margin regression comparison (if available) ---
+        if b["reg_margin"] is not None:
+            print(
+                f"           CLF: μ={b['margin']:+.1f}  |  "
+                f"REG: μ={b['reg_margin']:+.1f} P(cover)={b['reg_p_cover']:.1%}"
+            )
+
+        # --- Line 4: TRAP redirect ---
+        if has_trap:
+            trap_side = "away" if b["trap_away"] else "home"
+            trap_team = b[trap_side]
+            print(
+                f"       {Fore.YELLOW}! underdog {trap_team} EV+ es trampa — usar AH del favorito{Style.RESET_ALL}"
+            )
+
+        # --- O/U ---
+        ou_color = Fore.MAGENTA if b["ou_label"] == "UNDER" else Fore.BLUE
+        print(
+            f"       O/U {ou_color}{b['ou_label']}{Style.RESET_ALL} "
+            f"{b['ou_line']} ({b['ou_conf']}%)"
+        )
+
+        # --- Conformal margin ---
+        if b["conf_ss"] is not None:
+            if b["conf_ss"] == 1:
+                print(f"       {Fore.GREEN}conformal: margin={b['conf_margin']:.2f}{Style.RESET_ALL}")
+            else:
+                print(f"       {Fore.YELLOW}conformal: skip (set_size={b['conf_ss']}){Style.RESET_ALL}")
+
+        print()  # blank line between games
 
 
 def _is_underdog_trap(prob, ev):
     """Detecta EV+ en underdog con prob < 35% — empiricamente nunca se da."""
     return prob < 0.35 and ev > 0
-
-def _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_flag,
-                         sigmas=None, market_info=None, spread_home_odds=None, spread_away_odds=None):
-    """Muestra Expected Value y opcionalmente Kelly Criterion por partido.
-
-    Si sigmas esta disponible, usa robust_kelly(epsilon=sigma) en vez de eighth_kelly.
-    Detecta underdog traps (EV+ con prob < 35%) y sugiere AH del favorito.
-    """
-    if market_info is None:
-        market_info = {}
-    spreads = market_info.get("MARKET_SPREAD", np.zeros(len(games)))
-
-    if kelly_flag:
-        label = "Expected Value & Robust Kelly (σ-adaptive)" if sigmas is not None else "Expected Value & Kelly Criterion"
-        print(f"------------{label}-----------")
-    else:
-        print("---------------------Expected Value--------------------")
-
-    for idx, (home_team, away_team) in enumerate(games):
-        ev_home = ev_away = 0
-        if home_team_odds[idx] and away_team_odds[idx]:
-            ev_home = float(Expected_Value.expected_value(ml_probs[idx][1], int(home_team_odds[idx])))
-            ev_away = float(Expected_Value.expected_value(ml_probs[idx][0], int(away_team_odds[idx])))
-
-        ev_colors = {
-            "home": Fore.GREEN if ev_home > 0 else Fore.RED,
-            "away": Fore.GREEN if ev_away > 0 else Fore.RED,
-        }
-
-        if sigmas is not None:
-            sigma_i = float(sigmas[idx])
-            kelly_home = calculate_robust_kelly_simple(home_team_odds[idx], ml_probs[idx][1], epsilon=sigma_i)
-            kelly_away = calculate_robust_kelly_simple(away_team_odds[idx], ml_probs[idx][0], epsilon=sigma_i)
-            bankroll_home = f" Bankroll (DRO-Kelly, σ={sigma_i:.3f}): {kelly_home}%"
-            bankroll_away = f" Bankroll (DRO-Kelly, σ={sigma_i:.3f}): {kelly_away}%"
-        else:
-            sigma_i = 0.05
-            bankroll_home = (
-                f" Bankroll (\u215b-Kelly, cap 2.5%): "
-                f"{kc.calculate_eighth_kelly(home_team_odds[idx], ml_probs[idx][1])}%"
-            )
-            bankroll_away = (
-                f" Bankroll (\u215b-Kelly, cap 2.5%): "
-                f"{kc.calculate_eighth_kelly(away_team_odds[idx], ml_probs[idx][0])}%"
-            )
-
-        # --- Underdog trap detection ---
-        trap_home = _is_underdog_trap(ml_probs[idx][1], ev_home)
-        trap_away = _is_underdog_trap(ml_probs[idx][0], ev_away)
-
-        home_tag = f"  {Fore.YELLOW}TRAP{Style.RESET_ALL}" if trap_home else ""
-        away_tag = f"  {Fore.YELLOW}TRAP{Style.RESET_ALL}" if trap_away else ""
-
-        print(
-            f"{home_team} EV: {ev_colors['home']}{ev_home}{Style.RESET_ALL}"
-            f"{bankroll_home if kelly_flag else ''}{home_tag}"
-        )
-        print(
-            f"{away_team} EV: {ev_colors['away']}{ev_away}{Style.RESET_ALL}"
-            f"{bankroll_away if kelly_flag else ''}{away_tag}"
-        )
-
-        # --- AH redirect: cuando hay trap, mostrar AH del favorito ---
-        if trap_home or trap_away:
-            line = float(spreads[idx])
-            # El favorito es el lado opuesto al trap
-            if trap_away:
-                # away es underdog trap → favorito es home
-                fav_team = home_team
-                fav_prob = float(ml_probs[idx][1])
-                fav_ah = ah_probabilities(fav_prob, line)
-                sh = int(spread_home_odds[idx]) if spread_home_odds and spread_home_odds[idx] else -110
-                fav_ev = float(ah_expected_value(fav_ah, sh))
-                fav_p = fav_ah["p_full_win"] + fav_ah["p_half_win"]
-                fav_kelly = float(calculate_robust_kelly_simple(sh, fav_p, epsilon=sigma_i))
-                fav_line = f"{line:+.1f}"
-            else:
-                # home es underdog trap → favorito es away
-                fav_team = away_team
-                fav_prob = float(ml_probs[idx][0])
-                fav_ah = ah_probabilities(fav_prob, -line)
-                sa = int(spread_away_odds[idx]) if spread_away_odds and spread_away_odds[idx] else -110
-                fav_ev = float(ah_expected_value(fav_ah, sa))
-                fav_p = fav_ah["p_full_win"] + fav_ah["p_half_win"]
-                fav_kelly = float(calculate_robust_kelly_simple(sa, fav_p, epsilon=sigma_i))
-                fav_line = f"{-line:+.1f}"
-
-            ev_color = Fore.GREEN if fav_ev > 0 else Fore.RED
-            print(
-                f"    {Fore.CYAN}-> AH {fav_team} ({fav_line}): "
-                f"P={fav_p:.1%} EV={ev_color}{fav_ev:+.1f}{Style.RESET_ALL} "
-                f"Kelly={fav_kelly:.2f}%{Style.RESET_ALL}"
-            )
 
 
 def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_team_odds,
@@ -584,29 +596,14 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
         logger.info("Margin model: mean=%.1f, std=%.1f, range=[%.1f, %.1f]",
                      reg_margins.mean(), reg_margins.std(), reg_margins.min(), reg_margins.max())
 
-    _print_game_predictions(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
-                            todays_games_uo, conformal_set_sizes, conformal_margins,
-                            sigmas)
-
-    # Resumen conformal antes de EV/Kelly
-    if conformal_set_sizes is not None:
-        n_bet = int((conformal_set_sizes == 1).sum())
-        n_total = len(games)
-        print(f"\n  Conformal: {n_bet}/{n_total} juegos confiados"
-              f" (threshold={conformal.threshold_:.3f})")
-        if n_bet < n_total:
-            print(f"  {n_total - n_bet} juegos filtrados (set_size=2, ambas clases plausibles)\n")
-
-    # Resumen sigma
-    if sigmas is not None:
-        print(f"  Sigma: mean={sigmas.mean():.3f}, range=[{sigmas.min():.3f}, {sigmas.max():.3f}]"
-              f" → Kelly adaptativo (DRO)\n")
-
-    _print_ev_and_kelly(games, ml_probs, home_team_odds, away_team_odds, kelly_criterion, sigmas,
-                         market_info, spread_home_odds, spread_away_odds)
-
-    # --- Asian Handicap (spread) ---
-    _print_ah_section(games, ml_probs, spread_home_odds, spread_away_odds, market_info, sigmas, reg_margins)
+    # --- Output compacto: un bloque por partido, rankeado por EV ---
+    blocks = _build_game_blocks(
+        games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
+        todays_games_uo, home_team_odds, away_team_odds,
+        kelly_criterion, market_info, spread_home_odds, spread_away_odds,
+        conformal_set_sizes, conformal_margins, sigmas, reg_margins,
+    )
+    _print_compact_output(blocks, kelly_criterion, conformal, sigmas is not None)
 
     deinit()
     return _build_prediction_results(
