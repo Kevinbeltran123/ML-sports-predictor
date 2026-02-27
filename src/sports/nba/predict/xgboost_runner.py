@@ -49,124 +49,25 @@ def _load_calibrator(model_path):
 
 
 def _load_models():
-    """Carga modelos ML y UO usando el registry cuando esta disponible.
-
-    Orden de preferencia:
-    1. registry.load_production() — activa validacion de FeatureMismatchError
-    2. _select_model_path() — fallback si el registry no esta inicializado aun
-
-    El fallback asegura compatibilidad durante el primer setup (antes de bootstrap_production).
-    """
+    """Carga modelo ML (obligatorio) y UO (opcional)."""
     global xgb_ml, xgb_uo, xgb_ml_calibrator, xgb_uo_calibrator
 
     if xgb_ml is None:
-        xgb_ml = _load_ml_via_registry()
+        ml_path = _select_model_path("ML")
+        xgb_ml = xgb.Booster()
+        xgb_ml.load_model(str(ml_path))
+        xgb_ml_calibrator = _load_calibrator(ml_path)
+        logger.info("Modelo ML cargado: %s", ml_path.name)
 
     if xgb_uo is None:
-        xgb_uo = _load_uo_via_registry()
-
-
-def _load_ml_via_registry():
-    """Carga modelo ML a traves del registry (con validacion de features)."""
-    from src.core.models.registry import ModelRegistry
-    from src.core.models.feature_schema import FeatureMismatchError
-
-    registry = ModelRegistry()
-    try:
-        model = registry.load_production("moneyline")
-        logger.info("Modelo ML cargado via registry (produccion).")
-
-        # Cargar calibracion: buscar en production/ primero
-        from src.config import NBA_ML_MODELS_DIR
-        metadata = registry.get_metadata("moneyline")
-        model_file = metadata.get("production", {}).get("model_file", "")
-        if model_file:
-            # Buscar calibracion en production/ o flat
-            for search_dir in [NBA_ML_MODELS_DIR / "production", NBA_ML_MODELS_DIR]:
-                cal_path = search_dir / (Path(model_file).stem + "_calibration.pkl")
-                if cal_path.exists():
-                    global xgb_ml_calibrator
-                    xgb_ml_calibrator = joblib.load(cal_path)
-                    break
-
-        return model
-
-    except FileNotFoundError as exc:
-        logger.warning(
-            "Registry ML no inicializado, usando _select_model_path() como fallback: %s", exc
-        )
-        return _load_ml_fallback()
-    except FeatureMismatchError:
-        # Re-lanzar: es un error critico de seguridad
-        raise
-    except Exception as exc:
-        logger.warning(
-            "Error cargando via registry ML, usando fallback: %s", exc
-        )
-        return _load_ml_fallback()
-
-
-def _load_ml_fallback():
-    """Fallback: carga ML usando _select_model_path() (sin validacion de features)."""
-    global xgb_ml_calibrator
-    ml_path = _select_model_path("ML")
-    model = xgb.Booster()
-    model.load_model(str(ml_path))
-    xgb_ml_calibrator = _load_calibrator(ml_path)
-    logger.warning(
-        "Fallback: modelo ML cargado desde %s sin validacion de features.", ml_path.name
-    )
-    return model
-
-
-def _load_uo_via_registry():
-    """Carga modelo UO a traves del registry (con validacion de features)."""
-    from src.core.models.registry import ModelRegistry
-    from src.core.models.feature_schema import FeatureMismatchError
-
-    registry = ModelRegistry()
-    try:
-        model = registry.load_production("totals")
-        logger.info("Modelo UO cargado via registry (produccion).")
-
-        from src.config import NBA_UO_MODELS_DIR
-        metadata = registry.get_metadata("totals")
-        model_file = metadata.get("production", {}).get("model_file", "")
-        if model_file:
-            for search_dir in [NBA_UO_MODELS_DIR / "production", NBA_UO_MODELS_DIR]:
-                cal_path = search_dir / (Path(model_file).stem + "_calibration.pkl")
-                if cal_path.exists():
-                    global xgb_uo_calibrator
-                    xgb_uo_calibrator = joblib.load(cal_path)
-                    break
-
-        return model
-
-    except FileNotFoundError as exc:
-        logger.warning(
-            "Registry UO no inicializado, usando _select_model_path() como fallback: %s", exc
-        )
-        return _load_uo_fallback()
-    except FeatureMismatchError:
-        raise
-    except Exception as exc:
-        logger.warning(
-            "Error cargando via registry UO, usando fallback: %s", exc
-        )
-        return _load_uo_fallback()
-
-
-def _load_uo_fallback():
-    """Fallback: carga UO usando _select_model_path() (sin validacion de features)."""
-    global xgb_uo_calibrator
-    uo_path = _select_model_path("UO")
-    model = xgb.Booster()
-    model.load_model(str(uo_path))
-    xgb_uo_calibrator = _load_calibrator(uo_path)
-    logger.warning(
-        "Fallback: modelo UO cargado desde %s sin validacion de features.", uo_path.name
-    )
-    return model
+        try:
+            uo_path = _select_model_path("UO")
+            xgb_uo = xgb.Booster()
+            xgb_uo.load_model(str(uo_path))
+            xgb_uo_calibrator = _load_calibrator(uo_path)
+            logger.info("Modelo UO cargado: %s", uo_path.name)
+        except FileNotFoundError:
+            logger.info("Sin modelo UO — predicciones de totales desactivadas.")
 
 
 def _predict_probs(model, data, calibrator=None):
@@ -252,23 +153,32 @@ def _print_expected_value(
 def xgb_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, kelly_criterion):
     _load_models()
 
-    frame_uo = frame_ml.copy()
-    frame_uo["OU"] = np.asarray(todays_games_uo, dtype=float)
+    has_uo = xgb_uo is not None
+    ou_predictions_array = None
+    if has_uo:
+        frame_uo = frame_ml.copy()
+        frame_uo["OU"] = np.asarray(todays_games_uo, dtype=float)
 
     try:
         ml_predictions_array = _predict_probs(xgb_ml, data, xgb_ml_calibrator)
-        ou_predictions_array = _predict_probs(
-            xgb_uo,
-            frame_uo.values.astype(float),
-            xgb_uo_calibrator,
-        )
+        if has_uo:
+            ou_predictions_array = _predict_probs(
+                xgb_uo,
+                frame_uo.values.astype(float),
+                xgb_uo_calibrator,
+            )
 
         for idx, game in enumerate(games):
             home_team, away_team = game
             winner = int(np.argmax(ml_predictions_array[idx]))
-            under_over = int(np.argmax(ou_predictions_array[idx]))
             winner_confidence = round(ml_predictions_array[idx][winner] * 100, 1)
-            ou_confidence = round(ou_predictions_array[idx][under_over] * 100, 1)
+
+            if has_uo:
+                under_over = int(np.argmax(ou_predictions_array[idx]))
+                ou_confidence = round(ou_predictions_array[idx][under_over] * 100, 1)
+            else:
+                under_over = 0
+                ou_confidence = 0.0
 
             print(
                 _format_game_line(
