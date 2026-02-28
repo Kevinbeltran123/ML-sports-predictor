@@ -38,12 +38,20 @@ def _ensure_db():
         con.commit()
 
 
-def collect_lines(sportsbook: str = "fanduel", line_type: str = "closing"):
-    """Captura odds actuales y los guarda como opening o closing."""
+def collect_lines(sportsbook: str = "fanduel", line_type: str = "closing",
+                   odds_data: dict | None = None):
+    """Captura odds actuales y los guarda como opening o closing.
+
+    Args:
+        odds_data: Pre-fetched odds dict to reuse (avoids duplicate API call).
+                   If None, fetches from API.
+    """
     _ensure_db()
 
-    provider = OddsApiProvider(sportsbook=sportsbook)
-    odds = provider.get_odds()
+    odds = odds_data
+    if odds is None:
+        provider = OddsApiProvider(sportsbook=sportsbook)
+        odds = provider.get_odds()
     if not odds:
         logger.warning("No odds disponibles")
         return 0

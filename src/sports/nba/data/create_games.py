@@ -21,11 +21,16 @@ from src.sports.nba.features.fatigue import (
     add_fatigue_to_frame,
     add_travel_to_frame,
     add_extended_fatigue_to_frame,
+    add_fatigue_combo_to_frame,
     build_team_schedule,
     build_team_travel_schedule,
     get_game_fatigue,
     get_game_travel,
     get_game_extended_fatigue,
+)
+from src.sports.nba.features.conference_division import (
+    add_conference_division_to_frame,
+    get_game_conference_division,
 )
 from src.sports.nba.features.injury_impact import (
     add_availability_to_frame,
@@ -300,6 +305,7 @@ def main():
     adv_features_list = []
     espn_features_list = []
     lineup_comp_features_list = []
+    conf_div_features_list = []
     skipped_no_snapshot = 0
     skipped_zero_labels = 0
     snapshot_audit = []
@@ -521,6 +527,11 @@ def main():
                 )
                 extended_fatigue_list.append(ext_fatigue)
 
+                # Conference / Division: rivalidad y familiaridad
+                conf_div_features_list.append(
+                    get_game_conference_division(row.Home, row.Away)
+                )
+
                 # SRS features: rating ajustado por calidad de oponentes (Fase 5.5)
                 srs_feats = get_game_srs_features(
                     srs_lookup, date_str, row.Home, row.Away
@@ -668,6 +679,12 @@ def main():
 
     # Agregar fatiga extendida: TZ signed, altitud, densidad (Fase 5.4b)
     frame = add_extended_fatigue_to_frame(frame, extended_fatigue_list)
+
+    # Agregar interaction features: B2B × viaje, fatigue index
+    frame = add_fatigue_combo_to_frame(frame)
+
+    # Agregar conference / division rivalry features
+    frame = add_conference_division_to_frame(frame, conf_div_features_list)
 
     # Agregar SRS: Simple Rating System (MOV + SOS iterativo) (Fase 5.5)
     frame = add_srs_features_to_frame(frame, srs_features_list)

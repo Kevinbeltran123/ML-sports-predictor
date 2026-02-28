@@ -296,8 +296,8 @@ def predict_ingame(
           delta:               float — cambio vs p_pregame
           features:            dict — features usadas (para debug)
     """
-    # Inlined from ingame_dataset.py to avoid porting that module
-    PBP_ALL_FEATURES = [
+    # Feature lists for PBP models — v1 (18 features, original) and v2 (21, with score context)
+    PBP_V1_FEATURES = [
         "LOGIT_PREGAME",
         "PBP_LEAD_CHANGES", "PBP_LARGEST_LEAD_HOME", "PBP_LARGEST_LEAD_AWAY",
         "PBP_HOME_RUNS_MAX", "PBP_AWAY_RUNS_MAX",
@@ -308,7 +308,19 @@ def predict_ingame(
         "PBP_FG3_MADE_HOME", "PBP_FG3_MADE_AWAY",
         "PBP_OREB_HOME", "PBP_OREB_AWAY",
     ]
-    PBP_LOGISTIC_FEATURES = PBP_ALL_FEATURES[:9]  # Subset for logistic model
+    # v2: score-context features that fix home bias in blowouts
+    PBP_ALL_FEATURES = PBP_V1_FEATURES + [
+        "PBP_SCORE_DIFF_NORM",
+        "PBP_BLOWOUT_FLAG",
+        "PBP_SCORE_DIFF_X_MOMENTUM",
+    ]
+    PBP_LOGISTIC_V1 = PBP_V1_FEATURES[:9]  # v1: 9 features
+    # v2: 9 basic + 3 score-context = 12
+    PBP_LOGISTIC_FEATURES = PBP_LOGISTIC_V1 + [
+        "PBP_SCORE_DIFF_NORM",
+        "PBP_BLOWOUT_FLAG",
+        "PBP_SCORE_DIFF_X_MOMENTUM",
+    ]
 
     if market_prob is None:
         market_prob = p_pregame
@@ -323,20 +335,31 @@ def predict_ingame(
         try:
             import xgboost as xgb
 
-            # Construir vector de features en orden PBP_ALL_FEATURES
+            # Detect model version by feature count (v1=18, v2=21)
+            try:
+                model_num_features = int(booster.num_features())
+            except Exception:
+                model_num_features = len(PBP_V1_FEATURES)  # assume v1
+
+            if model_num_features == len(PBP_ALL_FEATURES):
+                feature_list = PBP_ALL_FEATURES
+            else:
+                feature_list = PBP_V1_FEATURES
+
+            # Construir vector de features en orden correcto para el modelo
             features_with_anchor = dict(pbp_features)
             features_with_anchor["LOGIT_PREGAME"] = logit_pregame
             X = np.array(
-                [[features_with_anchor.get(name, 0.0) for name in PBP_ALL_FEATURES]],
+                [[features_with_anchor.get(name, 0.0) for name in feature_list]],
                 dtype=np.float32,
             )
+            dmat = xgb.DMatrix(X, feature_names=feature_list)
 
             # Predecir con calibracion Platt
             if calibrator is not None:
-                proba = calibrator.predict_proba(X)  # (1, 2)
+                proba = calibrator.predict_proba(dmat)  # (1, 2)
                 p_home = float(proba[0, 1])
             else:
-                dmat = xgb.DMatrix(X)
                 raw = booster.predict(dmat)  # (1, 2)
                 p_home = float(raw[0, 1])
                 proba = raw
@@ -365,10 +388,21 @@ def predict_ingame(
     log_model, conformal_log = _load_logistic(period)
     if log_model is not None and pbp_features is not None:
         try:
+            # Detect logistic model version by feature count
+            try:
+                log_num_features = log_model.n_features_in_
+            except AttributeError:
+                log_num_features = len(PBP_LOGISTIC_V1)  # assume v1
+
+            if log_num_features == len(PBP_LOGISTIC_FEATURES):
+                log_feature_list = PBP_LOGISTIC_FEATURES
+            else:
+                log_feature_list = PBP_LOGISTIC_V1
+
             features_with_anchor = dict(pbp_features)
             features_with_anchor["LOGIT_PREGAME"] = logit_pregame
             X = np.array(
-                [[features_with_anchor.get(name, 0.0) for name in PBP_LOGISTIC_FEATURES]]
+                [[features_with_anchor.get(name, 0.0) for name in log_feature_list]]
             )
 
             proba = log_model.predict_proba(X)  # (1, 2)

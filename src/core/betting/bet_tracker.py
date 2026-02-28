@@ -178,6 +178,11 @@ class BetTracker:
                 ("ah_away_odds", "INTEGER"), ("ah_ev_home", "REAL"),
                 ("ah_ev_away", "REAL"), ("ah_kelly_home", "REAL"),
                 ("ah_kelly_away", "REAL"), ("ah_expected_margin", "REAL"),
+                # Margin regression columns
+                ("reg_margin", "REAL"), ("reg_p_cover_home", "REAL"),
+                ("reg_sigma", "REAL"),
+                # League column (NBA/WNBA)
+                ("league", "TEXT DEFAULT 'NBA'"),
             ]
             for col, dtype in new_cols:
                 if col not in existing:
@@ -230,7 +235,8 @@ class BetTracker:
                         ah_home_odds, ah_away_odds,
                         ah_ev_home, ah_ev_away,
                         ah_kelly_home, ah_kelly_away,
-                        ah_expected_margin
+                        ah_expected_margin,
+                        reg_margin, reg_p_cover_home, reg_sigma
                     ) VALUES (
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
@@ -243,7 +249,8 @@ class BetTracker:
                         ?, ?,
                         ?, ?,
                         ?, ?,
-                        ?
+                        ?,
+                        ?, ?, ?
                     )
                 """, (
                     game_date, timestamp, p["home_team"], p["away_team"], sportsbook,
@@ -260,6 +267,7 @@ class BetTracker:
                     p.get("ah_ev_home"), p.get("ah_ev_away"),
                     p.get("ah_kelly_home"), p.get("ah_kelly_away"),
                     p.get("ah_expected_margin"),
+                    p.get("reg_margin"), p.get("reg_p_cover_home"), p.get("reg_sigma"),
                 ))
             con.commit()
 

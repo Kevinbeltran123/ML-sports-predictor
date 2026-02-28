@@ -41,14 +41,26 @@ _SIGMA_BUCKETS = [
 # Fallback global (media ponderada de los buckets)
 NBA_MARGIN_SIGMA = 14.3
 
+# WNBA sigma buckets (lower scoring → lower variance, ~10-12 pts)
+_WNBA_SIGMA_BUCKETS = [
+    (2.0, 10.0),
+    (5.0, 10.5),
+    (8.0, 11.0),
+    (12.0, 11.5),
+    (float("inf"), 12.0),
+]
+WNBA_MARGIN_SIGMA = 11.0
 
-def _sigma_for_line(line):
+
+def _sigma_for_line(line, league="nba"):
     """Retorna σ calibrado según la magnitud del spread."""
+    buckets = _WNBA_SIGMA_BUCKETS if league == "wnba" else _SIGMA_BUCKETS
+    fallback = WNBA_MARGIN_SIGMA if league == "wnba" else NBA_MARGIN_SIGMA
     abs_line = abs(line)
-    for threshold, sigma in _SIGMA_BUCKETS:
+    for threshold, sigma in buckets:
         if abs_line <= threshold:
             return sigma
-    return NBA_MARGIN_SIGMA
+    return fallback
 
 
 def p_cover(p_win, line, sigma=None):
@@ -288,6 +300,23 @@ def expected_margin(p_win, sigma=NBA_MARGIN_SIGMA):
     if p_win <= 0.0 or p_win >= 1.0:
         return 0.0
     return float(sigma * norm.ppf(p_win))
+
+
+def p_cover_from_residual(residual, sigma):
+    """P(cover) directly from residual prediction (Camino B).
+
+    Residual = Margin + MARKET_SPREAD. Home covers when residual > 0.
+    P(cover) = Φ(residual / σ)
+
+    Args:
+        residual: predicted residual (positive = home covers).
+        sigma: uncertainty from sigma buckets.
+
+    Returns:
+        P(home covers spread), clipped to [0.01, 0.99].
+    """
+    z = residual / sigma
+    return float(np.clip(norm.cdf(z), 0.01, 0.99))
 
 
 def p_cover_regression(mu, line, sigma=None):

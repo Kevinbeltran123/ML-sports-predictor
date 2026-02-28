@@ -46,7 +46,10 @@ from pathlib import Path
 
 from colorama import Fore, Style, init, deinit
 
-from src.sports.nba.features.live_game_state import get_live_scoreboard, get_live_box_score, format_clock
+from src.sports.nba.features.live_game_state import (
+    get_live_scoreboard, get_live_box_score, get_live_play_by_play, format_clock,
+)
+from src.sports.nba.features.live_pbp_tracker import LivePBPTracker
 
 logger = logging.getLogger(__name__)
 
@@ -165,27 +168,64 @@ def multi_signal_adjustment(
     box_home: dict,
     box_away: dict,
     period: int = 1,
+    pbp_features: dict | None = None,
 ) -> tuple[float, float, str, int]:
-    """Ajuste multi-senal usando modelo logistico entrenado.
+    """Ajuste multi-senal delegando a ingame_runner.predict_ingame().
 
-    Usa 8 features diferenciales (FG%, TOV, REB, AST, FG3%, FT%, score_diff,
-    logit_pregame) para ajustar la probabilidad. Si el modelo no existe,
-    cae al bayesian_q1_adjustment() original.
+    predict_ingame() tiene el cascading correcto:
+      XGBoost PBP (18 features) -> Logistic PBP (9 features) -> Simple Bayesian
 
     Args:
-        p_pregame: probabilidad pre-partido del local (0.0 a 1.0)
-        box_home:  dict de stats del local (de get_live_box_score() o similar)
-        box_away:  dict de stats del visitante (mismo formato)
-        period:    periodo completado (1=Q1, 2=Q2, 3=Q3)
+        p_pregame:    probabilidad pre-partido del local (0.0 a 1.0)
+        box_home:     dict de stats del local (de get_live_box_score())
+        box_away:     dict de stats del visitante
+        period:       periodo completado (1=Q1, 2=Q2, 3=Q3)
+        pbp_features: dict con 17 PBP features de LivePBPTracker.get_features().
+                      Si se provee, XGBoost/Logistic PBP models se usan.
+                      Si es None, cae a Bayesian simple.
 
     Returns:
         (p_adjusted, delta, explanation, conformal_set_size)
     """
-    # Intentar cargar modelo entrenado
-    model, conformal = _load_ingame_model(period)
+    try:
+        from src.sports.nba.predict.ingame_runner import predict_ingame
 
-    if model is None:
-        # FALLBACK: formula simple (Stern 1994)
+        result = predict_ingame(
+            p_pregame=p_pregame,
+            box_home=box_home,
+            box_away=box_away,
+            period=period,
+            pbp_features=pbp_features,
+        )
+
+        p_adj = result["p_home"]
+        delta = result["delta"]
+        set_size = result["conformal_set_size"]
+        model_used = result["model_used"]
+
+        conf_label = "ALTA" if set_size == 1 else "BAJA" if set_size == 2 else "N/A"
+        explanation = (
+            f"[{model_used}] P={p_adj:.3f}, delta={delta:+.3f}, conf={conf_label}"
+        )
+
+        # Add top features to explanation if available
+        features = result.get("features", {})
+        top = []
+        for name in ["PBP_LEAD_CHANGES", "PBP_LARGEST_LEAD_HOME",
+                      "PBP_HOME_RUNS_MAX", "PBP_MOMENTUM",
+                      "SCORE_DIFF_NORM", "DIFF_FG_PCT"]:
+            val = features.get(name)
+            if val is not None and abs(val) > 0.01:
+                top.append(f"{name}={val:+.3f}")
+        if top:
+            explanation += f", {', '.join(top)}"
+
+        return p_adj, delta, explanation, set_size
+
+    except Exception as e:
+        logger.warning("predict_ingame failed (Q%d): %s. Using simple Bayesian.", period, e)
+
+        # Ultimate fallback: simple Bayesian
         home_pts = box_home.get("pts", box_home.get("PTS", 0))
         away_pts = box_away.get("pts", box_away.get("PTS", 0))
         score_diff = int(home_pts) - int(away_pts)
@@ -197,52 +237,6 @@ def multi_signal_adjustment(
         p_adj, expl = bayesian_q1_adjustment(p_pregame, score_diff, total_poss)
         delta = p_adj - p_pregame
         return p_adj, delta, f"[simple B=0.45] {expl}", 0
-
-    # --- Modelo entrenado disponible: computar features ---
-    from src.sports.nba.features.ingame_features import (
-        compute_ingame_differentials,
-        box_score_to_stats_dict,
-        INGAME_FEATURE_NAMES,
-    )
-    import numpy as np
-
-    # Convertir formato live API -> formato esperado por compute_ingame_differentials
-    home_stats = box_score_to_stats_dict(box_home)
-    away_stats = box_score_to_stats_dict(box_away)
-
-    # Computar las 8 features diferenciales
-    features = compute_ingame_differentials(home_stats, away_stats, p_pregame)
-
-    # Construir vector de features en el orden exacto
-    X = np.array([[features[name] for name in INGAME_FEATURE_NAMES]])
-
-    # Predecir probabilidad
-    p_adj = float(model.predict_proba(X)[0, 1])  # P(HOME_WIN=1)
-    delta = p_adj - p_pregame
-
-    # Conformal prediction para nivel de confianza
-    set_size = 0
-    if conformal is not None:
-        try:
-            proba = model.predict_proba(X)[0]  # [P(0), P(1)]
-            set_size, margin = conformal.predict_confidence(proba)
-        except Exception:
-            set_size = 0
-
-    # Explicacion con top features
-    top_features = []
-    for name in ["DIFF_FG_PCT", "SCORE_DIFF_NORM", "DIFF_TOV_RATE"]:
-        val = features.get(name, 0)
-        if abs(val) > 0.01:
-            top_features.append(f"{name}={val:+.3f}")
-
-    conf_label = "ALTA" if set_size == 1 else "BAJA" if set_size == 2 else "N/A"
-    explanation = (
-        f"[logistic Q{period}] P={p_adj:.3f}, delta={delta:+.3f}, "
-        f"conf={conf_label}, {', '.join(top_features)}"
-    )
-
-    return p_adj, delta, explanation, set_size
 
 
 def _match_game_to_prediction(game: dict, pregame_predictions: list[dict]) -> dict | None:
@@ -279,6 +273,7 @@ def _print_period_update(
     box: dict,
     period: int,
     prev_p: float | None = None,
+    pbp_features: dict | None = None,
 ):
     """Muestra el update de un cuarto finalizado (Q1, Q2 o Q3)."""
     home = pred["home_team"]
@@ -296,7 +291,8 @@ def _print_period_update(
     # Usar multi_signal_adjustment (con fallback automatico a simple)
     if box is not None:
         p_adj, delta_from_pre, expl, conf_set = multi_signal_adjustment(
-            p_pre, box["home"], box["away"], period=period
+            p_pre, box["home"], box["away"], period=period,
+            pbp_features=pbp_features,
         )
     else:
         total_poss = 25.0 * period
@@ -387,13 +383,14 @@ def run_live_session(pregame_predictions: list[dict]):
     print(f"\n{'=' * 65}")
     print(f"  LIVE BETTING -- {datetime.now().strftime('%H:%M:%S')}")
     print(f"  Monitoreando {len(pregame_predictions)} partido(s)")
-    print(f"  Cuartos: Q1, Q2, Q3 (ajuste multi-senal con fallback)")
+    print(f"  Cascade: XGBoost PBP -> Logistic PBP -> Bayesian simple")
     print(f"  (actualizacion cada {POLL_INTERVAL_SECONDS}s, Ctrl+C para salir)")
     print(f"{'=' * 65}\n")
 
     last_period = {}
     processed_periods = {}
     last_p_adjusted = {}
+    pbp_trackers = {}  # game_id -> LivePBPTracker
 
     start_time = time.time()
     max_seconds = MAX_POLL_HOURS * 3600
@@ -435,6 +432,21 @@ def run_live_session(pregame_predictions: list[dict]):
                 if game_id not in processed_periods:
                     processed_periods[game_id] = set()
 
+                # Create PBP tracker on first sight of a live game
+                if game_id not in pbp_trackers and status == 2:
+                    home_tri = game.get("home_tricode", "")
+                    away_tri = game.get("away_tricode", "")
+                    if home_tri and away_tri:
+                        pbp_trackers[game_id] = LivePBPTracker(home_tri, away_tri)
+                        logger.info("PBP tracker creado: %s vs %s (%s)",
+                                    home_tri, away_tri, game_id)
+
+                # Update PBP tracker with latest play-by-play data
+                if game_id in pbp_trackers and status == 2:
+                    actions = get_live_play_by_play(game_id)
+                    if actions:
+                        pbp_trackers[game_id].update(actions)
+
                 prev_period = last_period.get(game_id, 0)
 
                 for check_period in [1, 2, 3]:
@@ -444,11 +456,18 @@ def run_live_session(pregame_predictions: list[dict]):
 
                         box = get_live_box_score(game_id) if status == 2 else None
 
+                        # Get PBP features for the completed period
+                        pbp_feats = None
+                        tracker = pbp_trackers.get(game_id)
+                        if tracker is not None:
+                            pbp_feats = tracker.get_features(period_end=check_period)
+
                         prev_p = last_p_adjusted.get(game_id)
                         p_adj = _print_period_update(
                             game, pred, box,
                             period=check_period,
                             prev_p=prev_p,
+                            pbp_features=pbp_feats,
                         )
                         processed_periods[game_id].add(check_period)
                         last_p_adjusted[game_id] = p_adj

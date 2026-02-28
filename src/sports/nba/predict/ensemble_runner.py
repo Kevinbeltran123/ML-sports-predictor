@@ -26,9 +26,10 @@ from src.sports.nba.predict import xgboost_runner as XGBoost_Runner
 from src.core.betting import expected_value as Expected_Value
 from src.core.betting import kelly_criterion as kc
 from src.core.betting.robust_kelly import calculate_robust_kelly_simple
-from src.core.betting.spread_math import p_cover, expected_margin, ah_probabilities, p_cover_regression, p_win_from_margin
+from src.core.betting.spread_math import p_cover, expected_margin, ah_probabilities, p_cover_regression, p_win_from_margin, p_cover_from_residual
 from src.core.betting.expected_value import ah_expected_value
-from src.sports.nba.predict.margin_runner import predict_margins
+from src.sports.nba.predict.margin_runner import predict_margins, predict_margin_sigma, get_conformal_regressor, is_residual_model
+from src.sports.nba.predict.totals_runner import predict_totals, p_over as totals_p_over, get_totals_conformal
 
 init()
 
@@ -197,8 +198,16 @@ def _generate_all_predictions(data, todays_games_uo, frame_ml):
     # --- Combinar ML: weighted average ---
     ml_probs = W_XGB_ML * xgb_ml_probs + W_CAT_ML * cat_ml_probs
 
-    # --- O/U: XGBoost solo (opcional) ---
-    if XGBoost_Runner.xgb_uo is not None:
+    # --- O/U: Totals regression model (preferred) or XGBoost classifier (legacy) ---
+    predicted_totals = predict_totals(data)
+    if predicted_totals is not None:
+        # Use regression model: convert predicted total → P(over) via normal CDF
+        ou_lines = np.asarray(todays_games_uo, dtype=float)
+        p_over_arr = totals_p_over(predicted_totals, ou_lines)
+        ou_probs = np.column_stack([1.0 - p_over_arr, p_over_arr])
+        logger.info("Totals model: mean=%.1f, range=[%.1f, %.1f]",
+                     predicted_totals.mean(), predicted_totals.min(), predicted_totals.max())
+    elif XGBoost_Runner.xgb_uo is not None:
         frame_uo = frame_ml.copy()
         frame_uo["OU"] = np.asarray(todays_games_uo, dtype=float)
         ou_probs = XGBoost_Runner._predict_probs(
@@ -209,14 +218,15 @@ def _generate_all_predictions(data, todays_games_uo, frame_ml):
     else:
         ou_probs = np.full((len(todays_games_uo), 2), 0.5)
 
-    return ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs
+    return ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs, predicted_totals
 
 
 def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
                        todays_games_uo, home_team_odds, away_team_odds,
                        kelly_flag, market_info, spread_home_odds, spread_away_odds,
                        conformal_set_sizes=None, conformal_margins=None,
-                       sigmas=None, reg_margins=None):
+                       sigmas=None, reg_margins=None, reg_sigmas=None,
+                       predicted_totals=None):
     """Construye bloques de output por partido con toda la info consolidada.
 
     Retorna lista de dicts con datos pre-calculados, rankeados por max EV descendente.
@@ -241,6 +251,7 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
         b["ou_label"] = "OVER" if under_over == 1 else "UNDER"
         b["ou_line"] = todays_games_uo[idx]
         b["ou_conf"] = round(ou_probs[idx][under_over] * 100, 1)
+        b["predicted_total"] = float(predicted_totals[idx]) if predicted_totals is not None else None
 
         # --- EV + Kelly (ML) ---
         ev_home = ev_away = 0.0
@@ -321,11 +332,64 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
 
         # --- Margin regression ---
         if reg_margins is not None:
-            mu_reg = float(reg_margins[idx])
-            b["reg_margin"] = mu_reg
-            b["reg_p_cover"] = p_cover_regression(mu_reg, line)
+            raw_pred = float(reg_margins[idx])
+            reg_sigma_val = float(reg_sigmas[idx]) if reg_sigmas is not None else None
+            b["reg_sigma"] = reg_sigma_val
+
+            if is_residual_model():
+                # Camino B: model outputs residual = margin + spread
+                b["reg_residual"] = raw_pred
+                b["reg_margin"] = raw_pred - line  # convert back to raw margin
+                b["reg_p_cover"] = p_cover_from_residual(raw_pred, sigma=reg_sigma_val) if reg_sigma_val else 0.5
+
+                # For AH EV: use residual-based P(cover)
+                reg_p_home_cover = b["reg_p_cover"]
+                reg_p_away_cover = p_cover_from_residual(-raw_pred, sigma=reg_sigma_val) if reg_sigma_val else 0.5
+
+                # Conformal: simpler check for residual model
+                conformal_reg = get_conformal_regressor()
+                if conformal_reg is not None:
+                    b["reg_confident"] = conformal_reg.is_confident_residual(raw_pred)
+                    b["reg_conf_margin"] = conformal_reg.confidence_margin_residual(raw_pred)
+                else:
+                    b["reg_confident"] = None
+                    b["reg_conf_margin"] = None
+            else:
+                # Legacy: raw margin model
+                mu_reg = raw_pred
+                b["reg_residual"] = None
+                b["reg_margin"] = mu_reg
+                b["reg_p_cover"] = p_cover_regression(mu_reg, line, sigma=reg_sigma_val)
+
+                reg_p_home_cover = b["reg_p_cover"]
+                reg_p_away_cover = p_cover_regression(-mu_reg, -line, sigma=reg_sigma_val)
+
+                conformal_reg = get_conformal_regressor()
+                if conformal_reg is not None:
+                    b["reg_confident"] = conformal_reg.is_confident(mu_reg, line)
+                    b["reg_conf_margin"] = conformal_reg.confidence_margin(mu_reg, line)
+                else:
+                    b["reg_confident"] = None
+                    b["reg_conf_margin"] = None
+
+            # AH EV override with regression-based P(cover)
+            reg_ah_ev_home = float(ah_expected_value(
+                {"p_full_win": reg_p_home_cover, "p_half_win": 0.0,
+                 "p_half_loss": 0.0, "p_full_loss": 1.0 - reg_p_home_cover,
+                 "is_quarter": False}, sh_odds))
+            reg_ah_ev_away = float(ah_expected_value(
+                {"p_full_win": reg_p_away_cover, "p_half_win": 0.0,
+                 "p_half_loss": 0.0, "p_full_loss": 1.0 - reg_p_away_cover,
+                 "is_quarter": False}, sa_odds))
+
+            b["reg_ah_ev_home"] = reg_ah_ev_home
+            b["reg_ah_ev_away"] = reg_ah_ev_away
+            b["reg_p_home_cover"] = reg_p_home_cover
+            b["reg_p_away_cover"] = reg_p_away_cover
         else:
             b["reg_margin"] = None
+            b["reg_residual"] = None
+            b["reg_sigma"] = None
 
         blocks.append(b)
 
@@ -336,21 +400,35 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
 
 def _print_compact_output(blocks, kelly_flag, conformal=None, has_sigma=False):
     """Imprime bloques compactos por partido, rankeados por EV."""
+    # Threshold de Kelly para permitir BET con conformal incierto (set_size=2)
+    CONF2_KELLY_THRESHOLD = 0.5  # % del bankroll
+
     # Header
     n_total = len(blocks)
-    n_bet = sum(1 for b in blocks if b["conf_ss"] == 1) if blocks[0]["conf_ss"] is not None else n_total
+    n_bet = sum(
+        1 for b in blocks
+        if b["conf_ss"] == 1 or (b["conf_ss"] == 2 and max(b["kelly_home"], b["kelly_away"]) >= CONF2_KELLY_THRESHOLD)
+    ) if blocks[0]["conf_ss"] is not None else n_total
     sigma_label = " | DRO-Kelly" if has_sigma else ""
     conf_label = f" | Conformal {n_bet}/{n_total}" if blocks[0]["conf_ss"] is not None else ""
     print(f"\n{Fore.CYAN}{'='*60}")
     print(f"  PICKS ranked by EV{conf_label}{sigma_label}")
     print(f"{'='*60}{Style.RESET_ALL}\n")
 
+    # Threshold de Kelly para permitir BET con conformal incierto (set_size=2)
+    CONF2_KELLY_THRESHOLD = 0.5  # % del bankroll
+
     for rank, b in enumerate(blocks, 1):
         # --- Status tag: BET / SKIP / TRAP ---
         has_trap = b["trap_home"] or b["trap_away"]
+        max_kelly = max(b["kelly_home"], b["kelly_away"])
+        conf_uncertain = b["conf_ss"] is not None and b["conf_ss"] != 1
+        # Permitir BET con conf=2 si Kelly supera el umbral (edge robusto a pesar de incertidumbre)
+        conf_override = conf_uncertain and max_kelly >= CONF2_KELLY_THRESHOLD
+
         if has_trap:
             tag = f"{Fore.YELLOW}TRAP{Style.RESET_ALL}"
-        elif b["conf_ss"] is not None and b["conf_ss"] != 1:
+        elif conf_uncertain and not conf_override:
             tag = f"{Fore.YELLOW}SKIP{Style.RESET_ALL}"
         elif b["max_ev"] > 0:
             tag = f"{Fore.GREEN}BET{Style.RESET_ALL}"
@@ -407,10 +485,24 @@ def _print_compact_output(blocks, kelly_flag, conformal=None, has_sigma=False):
 
         # --- Line 3b: Margin regression comparison (if available) ---
         if b["reg_margin"] is not None:
-            print(
-                f"           CLF: μ={b['margin']:+.1f}  |  "
-                f"REG: μ={b['reg_margin']:+.1f} P(cover)={b['reg_p_cover']:.1%}"
-            )
+            reg_conf_str = ""
+            if b.get("reg_confident") is not None:
+                conf_tag = f"{Fore.GREEN}CONF" if b["reg_confident"] else f"{Fore.YELLOW}WEAK"
+                reg_conf_str = f"  [{conf_tag}{Style.RESET_ALL} Δ={b['reg_conf_margin']:+.1f}]"
+            sigma_str = f" σ={b['reg_sigma']:.1f}" if b.get("reg_sigma") else ""
+            if b.get("reg_residual") is not None:
+                # Camino B: show residual + converted margin
+                print(
+                    f"           CLF: μ={b['margin']:+.1f}  |  "
+                    f"REG: res={b['reg_residual']:+.1f} μ={b['reg_margin']:+.1f} "
+                    f"P(cover)={b['reg_p_cover']:.1%}{sigma_str}{reg_conf_str}"
+                )
+            else:
+                # Legacy: raw margin
+                print(
+                    f"           CLF: μ={b['margin']:+.1f}  |  "
+                    f"REG: μ={b['reg_margin']:+.1f} P(cover)={b['reg_p_cover']:.1%}{sigma_str}{reg_conf_str}"
+                )
 
         # --- Line 4: TRAP redirect ---
         if has_trap:
@@ -422,15 +514,18 @@ def _print_compact_output(blocks, kelly_flag, conformal=None, has_sigma=False):
 
         # --- O/U ---
         ou_color = Fore.MAGENTA if b["ou_label"] == "UNDER" else Fore.BLUE
+        pred_str = f" pred={b['predicted_total']:.0f}" if b.get("predicted_total") is not None else ""
         print(
             f"       O/U {ou_color}{b['ou_label']}{Style.RESET_ALL} "
-            f"{b['ou_line']} ({b['ou_conf']}%)"
+            f"{b['ou_line']} ({b['ou_conf']}%){pred_str}"
         )
 
         # --- Conformal margin ---
         if b["conf_ss"] is not None:
             if b["conf_ss"] == 1:
                 print(f"       {Fore.GREEN}conformal: margin={b['conf_margin']:.2f}{Style.RESET_ALL}")
+            elif conf_override:
+                print(f"       {Fore.CYAN}conformal: set_size=2 pero Kelly={max_kelly:.2f}% >= {CONF2_KELLY_THRESHOLD}% → BET override{Style.RESET_ALL}")
             else:
                 print(f"       {Fore.YELLOW}conformal: skip (set_size={b['conf_ss']}){Style.RESET_ALL}")
 
@@ -446,7 +541,7 @@ def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_t
                               away_team_odds, market_info, conformal_set_sizes=None,
                               conformal_margins=None, sigmas=None,
                               spread_home_odds=None, spread_away_odds=None,
-                              reg_margins=None):
+                              reg_margins=None, reg_sigmas=None):
     """Empaqueta predicciones en lista de dicts para BetTracker.
 
     market_info contiene MARKET_SPREAD y MARKET_ML_PROB extraidos antes
@@ -542,10 +637,19 @@ def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_t
 
         # --- Margin Regression (si disponible) ---
         if reg_margins is not None:
-            mu_reg = float(reg_margins[idx])
-            entry["reg_margin"] = mu_reg
-            entry["reg_p_win"] = p_win_from_margin(mu_reg)
-            entry["reg_p_cover"] = p_cover_regression(mu_reg, line)
+            raw_pred = float(reg_margins[idx])
+            reg_sigma_val = float(reg_sigmas[idx]) if reg_sigmas is not None else None
+            entry["reg_sigma"] = reg_sigma_val
+
+            if is_residual_model():
+                entry["reg_residual"] = raw_pred
+                entry["reg_margin"] = raw_pred - line
+                entry["reg_p_win"] = p_win_from_margin(raw_pred - line)
+                entry["reg_p_cover_home"] = p_cover_from_residual(raw_pred, sigma=reg_sigma_val) if reg_sigma_val else 0.5
+            else:
+                entry["reg_margin"] = raw_pred
+                entry["reg_p_win"] = p_win_from_margin(raw_pred)
+                entry["reg_p_cover_home"] = p_cover_regression(raw_pred, line, sigma=reg_sigma_val)
 
         result.append(entry)
     return result
@@ -567,7 +671,7 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
     """
     if market_info is None:
         market_info = {}
-    ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs = _generate_all_predictions(
+    ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs, predicted_totals = _generate_all_predictions(
         data, todays_games_uo, frame_ml
     )
 
@@ -592,16 +696,21 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
 
     # --- Margin regression model (opcional) ---
     reg_margins = predict_margins(data)
+    reg_sigmas = None
     if reg_margins is not None:
         logger.info("Margin model: mean=%.1f, std=%.1f, range=[%.1f, %.1f]",
                      reg_margins.mean(), reg_margins.std(), reg_margins.min(), reg_margins.max())
+        # Sigma calibrado por bucket de spread
+        spreads = market_info.get("MARKET_SPREAD", np.zeros(len(games)))
+        reg_sigmas = predict_margin_sigma(spreads)
 
     # --- Output compacto: un bloque por partido, rankeado por EV ---
     blocks = _build_game_blocks(
         games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
         todays_games_uo, home_team_odds, away_team_odds,
         kelly_criterion, market_info, spread_home_odds, spread_away_odds,
-        conformal_set_sizes, conformal_margins, sigmas, reg_margins,
+        conformal_set_sizes, conformal_margins, sigmas, reg_margins, reg_sigmas,
+        predicted_totals,
     )
     _print_compact_output(blocks, kelly_criterion, conformal, sigmas is not None)
 
@@ -610,5 +719,5 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
         games, ml_probs, ou_probs, todays_games_uo,
         home_team_odds, away_team_odds, market_info,
         conformal_set_sizes, conformal_margins, sigmas,
-        spread_home_odds, spread_away_odds, reg_margins,
+        spread_home_odds, spread_away_odds, reg_margins, reg_sigmas,
     )

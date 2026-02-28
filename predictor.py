@@ -14,6 +14,7 @@ import toml
 from colorama import Fore, Style
 
 from src.sports.nba.providers.odds_api import OddsApiProvider, BOOKMAKER_MAP
+from src.core.odds_cache import OddsCache
 from src.sports.nba.predict import xgboost_runner as XGBoost_Runner, ensemble_runner as Ensemble_Runner
 from src.sports.nba.features.advanced_stats import add_advanced_features
 from src.sports.nba.features.style_features import add_style_features
@@ -36,11 +37,16 @@ from src.sports.nba.features.fatigue import (
     add_fatigue_to_frame,
     add_travel_to_frame,
     add_extended_fatigue_to_frame,
+    add_fatigue_combo_to_frame,
     build_team_schedule,
     build_team_travel_schedule,
     get_game_fatigue,
     get_game_travel,
     get_game_extended_fatigue,
+)
+from src.sports.nba.features.conference_division import (
+    add_conference_division_to_frame,
+    get_game_conference_division,
 )
 from src.sports.nba.features.sos import (
     add_sos_to_frame,
@@ -83,6 +89,7 @@ from src.config import (
     PROJECT_ROOT,
     SCHEDULES_DIR,
     DROP_COLUMNS_ML,
+    POLYMARKET_DEFAULT_BANKROLL,
     get_logger,
 )
 
@@ -296,6 +303,7 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     travel_features_list = []
     sos_features_list = []
     extended_fatigue_list = []
+    conf_div_features_list = []
     srs_features_list = []
     lineup_features_list = []
     referee_features_list = []
@@ -388,6 +396,10 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
                 "TRAVEL_7D_HOME": 0.0, "TRAVEL_7D_AWAY": 0.0,
             })
 
+        conf_div_features_list.append(
+            get_game_conference_division(home_team, away_team)
+        )
+
         if sos_lookup:
             sos_features_list.append(
                 get_game_sos(sos_lookup, today_str, home_team, away_team)
@@ -450,6 +462,8 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     games_data_frame = add_travel_to_frame(games_data_frame, travel_features_list)
     games_data_frame = add_sos_to_frame(games_data_frame, sos_features_list)
     games_data_frame = add_extended_fatigue_to_frame(games_data_frame, extended_fatigue_list)
+    games_data_frame = add_fatigue_combo_to_frame(games_data_frame)
+    games_data_frame = add_conference_division_to_frame(games_data_frame, conf_div_features_list)
     games_data_frame = add_srs_features_to_frame(games_data_frame, srs_features_list)
     games_data_frame = add_lineup_features_to_frame(games_data_frame, lineup_features_list)
     games_data_frame = add_referee_features_to_frame(games_data_frame, referee_features_list)
@@ -505,10 +519,13 @@ def resolve_games(odds, sportsbook):
 def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, args,
                odds=None, market_info=None, spread_home_odds=None, spread_away_odds=None):
     predictions = None
-    if args.ensemble:
+    use_ensemble = args.ensemble or (args.odds and not args.xgb)
+    use_kelly = args.kelly or use_ensemble  # kelly always on with ensemble
+
+    if use_ensemble:
         print("--------------Ensemble Model Predictions---------------")
         predictions = Ensemble_Runner.ensemble_runner(
-            data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, args.kelly,
+            data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, use_kelly,
             market_info=market_info,
             spread_home_odds=spread_home_odds,
             spread_away_odds=spread_away_odds,
@@ -518,17 +535,18 @@ def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team
     if args.xgb:
         print("---------------XGBoost Model Predictions---------------")
         XGBoost_Runner.xgb_runner(
-            data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, args.kelly
+            data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, use_kelly
         )
         print("-------------------------------------------------------")
     return predictions
 
 
-def main(args):
+def main(args, odds_cache=None):
     odds = None
     if args.odds:
-        provider = OddsApiProvider(sportsbook=args.odds)
-        odds = provider.get_odds()
+        if odds_cache is None:
+            odds_cache = OddsCache(sportsbook=args.odds)
+        odds = odds_cache.get("basketball_nba")
 
     games, odds = resolve_games(odds, args.odds)
     if games is None:
@@ -595,10 +613,10 @@ def main(args):
         except Exception as e:
             logger.warning("BetTracker save failed: %s", e)
 
-        # Save opening lines for CLV
+        # Save opening lines for CLV (reuse cached odds — no extra API call)
         try:
             from scripts.collect_closing_lines import collect_lines
-            collect_lines(sportsbook=args.odds, line_type="opening")
+            collect_lines(sportsbook=args.odds, line_type="opening", odds_data=odds)
         except Exception as e:
             logger.debug("Opening lines save skipped: %s", e)
 
@@ -612,6 +630,54 @@ def main(args):
             print_clv_tracking_report()
         except Exception as e:
             logger.warning("CLV report error: %s", e)
+
+    # --- Polymarket signals ---
+    if args.polymarket and predictions:
+        try:
+            from src.sports.nba.providers.polymarket import PolymarketProvider
+            from src.sports.nba.predict.polymarket_runner import (
+                generate_polymarket_signals,
+                log_signals_to_tracker,
+                print_polymarket_output,
+            )
+            from src.core.betting.polymarket_tracker import PolymarketTracker
+
+            pm_provider = PolymarketProvider()
+            pm_markets_raw = pm_provider.get_nba_markets()
+            pm_markets = pm_provider.match_markets_to_games(games, pm_markets_raw)
+
+            if pm_markets:
+                bankroll_usdc = args.bankroll_usdc or POLYMARKET_DEFAULT_BANKROLL
+                dry_run = not args.execute
+
+                pm_signals = generate_polymarket_signals(
+                    predictions, pm_markets, bankroll=bankroll_usdc, dry_run=dry_run,
+                )
+                print_polymarket_output(pm_signals, bankroll=bankroll_usdc, dry_run=dry_run)
+
+                # Log to tracker
+                tracker_pm = PolymarketTracker()
+                log_signals_to_tracker(pm_signals, tracker_pm, dry_run=dry_run)
+                tracker_pm.save_bankroll_snapshot(bankroll_usdc, dry_run=dry_run)
+
+                # Execute real orders if --execute
+                if args.execute:
+                    try:
+                        from src.sports.nba.providers.polymarket_trader import PolymarketTrader
+                        trader = PolymarketTrader()
+                        for sig in pm_signals:
+                            if sig.action == "BUY" and sig.token_id:
+                                trader.buy_shares(
+                                    token_id=sig.token_id,
+                                    price=sig.market_price,
+                                    size=sig.shares,
+                                )
+                    except Exception as e:
+                        logger.warning("Polymarket execution error (falling back to dry-run): %s", e)
+            else:
+                logger.info("No Polymarket markets matched today's games")
+        except Exception as e:
+            logger.warning("Polymarket signals error: %s", e)
 
     # --- Live betting session ---
     if args.live and predictions:
@@ -629,14 +695,254 @@ def main(args):
         except Exception as e:
             logger.warning("Live session error: %s", e)
 
+    # --- Polymarket live position management ---
+    if args.polymarket_live and args.polymarket and predictions:
+        try:
+            from src.sports.nba.predict.polymarket_live import run_polymarket_live_session
+            from src.core.betting.polymarket_tracker import PolymarketTracker
+
+            tracker_pm = PolymarketTracker()
+            dry_run = not args.execute
+            bankroll_usdc = args.bankroll_usdc or POLYMARKET_DEFAULT_BANKROLL
+
+            pregame_preds = [
+                {
+                    "home_team": p["home_team"],
+                    "away_team": p["away_team"],
+                    "p_pregame": p["prob_home"],
+                }
+                for p in predictions
+            ]
+            run_polymarket_live_session(
+                pregame_preds, tracker_pm,
+                bankroll=bankroll_usdc, dry_run=dry_run,
+            )
+        except Exception as e:
+            logger.warning("Polymarket live session error: %s", e)
+
+
+def run_wnba(args, odds_cache=None):
+    """WNBA prediction pipeline — uses WNBA-specific models, teams, and odds."""
+    from src.sports.wnba.config_wnba import (
+        WNBA_ODDS_API_SPORT, team_index_wnba, WNBA_TEAMS,
+    )
+    from src.config import WNBA_ML_MODELS_DIR, WNBA_TEAMS_DB, WNBA_BETS_DB
+
+    odds = None
+    if args.odds:
+        if odds_cache is None:
+            odds_cache = OddsCache(sportsbook=args.odds)
+        odds = odds_cache.get(WNBA_ODDS_API_SPORT)
+
+    if not odds:
+        print("No WNBA games found today.")
+        return
+
+    games = []
+    for game_key in odds.keys():
+        home, away = game_key.split(":")
+        if home in team_index_wnba and away in team_index_wnba:
+            games.append((home, away))
+
+    if not games:
+        print("No WNBA games matched known teams.")
+        return
+
+    print(f"------------------WNBA {args.odds} odds------------------")
+    for game_key in odds.keys():
+        home, away = game_key.split(":")
+        game = odds[game_key]
+        print(f"{away} ({game[away]['money_line_odds']}) @ {home} ({game[home]['money_line_odds']})")
+
+    print("\n  WNBA pipeline requires trained models in models/wnba/moneyline/")
+    print("  Run: PYTHONPATH=. python scripts/train_models_wnba.py")
+    print(f"  Found {len(games)} WNBA games today.")
+
+
+def interactive_menu():
+    """Interactive menu — no flags needed, just run `python predictor.py`."""
+    from colorama import Fore, Style, init
+    init()
+
+    SPORTSBOOKS = ['fanduel', 'draftkings', 'betmgm', 'pointsbet', 'caesars', 'wynn', 'bet_rivers_ny']
+
+    print(f"\n{Fore.CYAN}{'=' * 50}")
+    print(f"  NBA W/L Predictor")
+    print(f"{'=' * 50}{Style.RESET_ALL}\n")
+
+    # --- League ---
+    print(f"  {Fore.YELLOW}Liga:{Style.RESET_ALL}")
+    print(f"    1) NBA")
+    print(f"    2) WNBA")
+    league_choice = input(f"\n  Selecciona [1]: ").strip() or "1"
+    league = "wnba" if league_choice == "2" else "nba"
+
+    # --- Sportsbook ---
+    print(f"\n  {Fore.YELLOW}Sportsbook:{Style.RESET_ALL}")
+    for i, book in enumerate(SPORTSBOOKS, 1):
+        default_tag = " (default)" if book == "fanduel" else ""
+        print(f"    {i}) {book}{default_tag}")
+    book_choice = input(f"\n  Selecciona [1]: ").strip() or "1"
+    try:
+        sportsbook = SPORTSBOOKS[int(book_choice) - 1]
+    except (ValueError, IndexError):
+        sportsbook = "fanduel"
+
+    # --- Model ---
+    print(f"\n  {Fore.YELLOW}Modelo:{Style.RESET_ALL}")
+    print(f"    1) Ensemble XGB 60% + CatBoost 40% (default)")
+    print(f"    2) XGBoost solo")
+    model_choice = input(f"\n  Selecciona [1]: ").strip() or "1"
+    use_ensemble = model_choice != "2"
+    use_xgb = model_choice == "2"
+
+    # --- Features ---
+    print(f"\n  {Fore.YELLOW}Features adicionales (separados por coma, o 'all'):{Style.RESET_ALL}")
+    print(f"    1) CLV report")
+    print(f"    2) Live betting (Q1-Q3)")
+    print(f"    3) Polymarket")
+    print(f"    4) Ninguno")
+    features_input = input(f"\n  Selecciona [4]: ").strip() or "4"
+
+    use_clv = False
+    use_live = False
+    use_polymarket = False
+    use_polymarket_live = False
+    use_execute = False
+    bankroll_usdc = None
+
+    if features_input.lower() == "all":
+        use_clv = True
+        use_live = True
+        use_polymarket = True
+    else:
+        choices = [c.strip() for c in features_input.split(",")]
+        use_clv = "1" in choices
+        use_live = "2" in choices
+        use_polymarket = "3" in choices
+
+    # --- Polymarket sub-options ---
+    if use_polymarket:
+        print(f"\n  {Fore.MAGENTA}Polymarket opciones:{Style.RESET_ALL}")
+
+        bankroll_input = input(f"    Bankroll USDC [{POLYMARKET_DEFAULT_BANKROLL}]: ").strip()
+        if bankroll_input:
+            try:
+                bankroll_usdc = float(bankroll_input)
+            except ValueError:
+                bankroll_usdc = None
+
+        print(f"\n    1) Dry-run (solo senales, default)")
+        print(f"    2) Ejecutar ordenes reales")
+        exec_choice = input(f"\n    Selecciona [1]: ").strip() or "1"
+        use_execute = exec_choice == "2"
+
+        if use_execute:
+            confirm = input(f"    {Fore.RED}CONFIRMAR ejecucion real? (si/no) [no]: {Style.RESET_ALL}").strip()
+            if confirm.lower() not in ("si", "s", "yes", "y"):
+                use_execute = False
+                print(f"    -> Modo dry-run")
+
+        pm_live_choice = input(f"\n    Gestion de posiciones live? (s/n) [n]: ").strip()
+        use_polymarket_live = pm_live_choice.lower() in ("s", "si", "y", "yes")
+
+    # --- Summary ---
+    print(f"\n{Fore.GREEN}{'─' * 50}")
+    print(f"  Configuracion:")
+    print(f"    Liga:        {league.upper()}")
+    print(f"    Sportsbook:  {sportsbook}")
+    print(f"    Modelo:      {'Ensemble' if use_ensemble else 'XGBoost solo'}")
+    print(f"    Kelly:       si")
+    extras = []
+    if use_clv:
+        extras.append("CLV")
+    if use_live:
+        extras.append("Live Q1-Q3")
+    if use_polymarket:
+        pm_label = "Polymarket"
+        if use_execute:
+            pm_label += " (REAL)"
+        else:
+            pm_label += " (dry-run)"
+        if bankroll_usdc:
+            pm_label += f" ${bankroll_usdc:.0f}"
+        if use_polymarket_live:
+            pm_label += " + live"
+        extras.append(pm_label)
+    print(f"    Extras:      {', '.join(extras) if extras else 'ninguno'}")
+    print(f"{'─' * 50}{Style.RESET_ALL}\n")
+
+    confirm = input(f"  Ejecutar? (Enter = si, n = cancelar): ").strip()
+    if confirm.lower() in ("n", "no"):
+        print("  Cancelado.")
+        return
+
+    # --- Build args namespace ---
+    args = argparse.Namespace(
+        ensemble=use_ensemble,
+        xgb=use_xgb,
+        odds=sportsbook,
+        kelly=True,
+        clv=use_clv,
+        live=use_live,
+        polymarket=use_polymarket,
+        polymarket_live=use_polymarket_live,
+        execute=use_execute,
+        bankroll_usdc=bankroll_usdc,
+        league=league,
+    )
+
+    odds_cache = OddsCache(sportsbook=sportsbook)
+
+    if league == "wnba":
+        run_wnba(args, odds_cache=odds_cache)
+    else:
+        main(args, odds_cache=odds_cache)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='NBA W/L Predictor — Ensemble XGBoost 60%% + CatBoost 40%%')
-    parser.add_argument('-ensemble', action='store_true', help='Run Ensemble (XGBoost 60%% + CatBoost 40%%)')
-    parser.add_argument('-xgb', action='store_true', help='Run XGBoost solo')
-    parser.add_argument('-odds', help='Sportsbook: fanduel, draftkings, betmgm, pointsbet, caesars, wynn, bet_rivers_ny')
-    parser.add_argument('-kelly', '--kelly', '-kc', dest='kelly', action='store_true', help='Calcula Kelly stake (% de bankroll)')
-    parser.add_argument('-clv', action='store_true', help='Imprime reporte CLV (Closing Line Value)')
-    parser.add_argument('--live', action='store_true', help='Activa live betting (polling Q1-Q3)')
-    args = parser.parse_args()
-    main(args)
+    # If CLI args provided, use traditional mode; otherwise interactive menu
+    import sys
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser(
+            description='NBA W/L Predictor — Ensemble XGBoost 60%% + CatBoost 40%%',
+            epilog='Run without arguments for interactive menu.',
+        )
+        parser.add_argument('-ensemble', action='store_true',
+                            help='Run Ensemble (default when -odds is set)')
+        parser.add_argument('-xgb', action='store_true', help='Run XGBoost solo')
+        parser.add_argument('-odds',
+                            help='Sportsbook: fanduel, draftkings, betmgm, pointsbet, caesars, wynn, bet_rivers_ny')
+        parser.add_argument('-kelly', '--kelly', '-kc', dest='kelly', action='store_true',
+                            help='Kelly stake (default on with ensemble)')
+        parser.add_argument('-clv', action='store_true', help='CLV (Closing Line Value) report')
+        parser.add_argument('--live', action='store_true', help='Live betting (polling Q1-Q3)')
+        parser.add_argument('--polymarket', action='store_true', help='Polymarket trading signals')
+        parser.add_argument('--polymarket-live', dest='polymarket_live', action='store_true',
+                            help='Polymarket live position management')
+        parser.add_argument('--execute', action='store_true',
+                            help='Execute real Polymarket orders (default: dry-run)')
+        parser.add_argument('--bankroll-usdc', dest='bankroll_usdc', type=float, default=None,
+                            help='USDC bankroll for Polymarket (default: 50)')
+        parser.add_argument('--league', choices=['nba', 'wnba'], default='nba',
+                            help='League: nba (default) or wnba')
+        parser.add_argument('--all', action='store_true',
+                            help='Enable all features: ensemble + kelly + clv + live + polymarket')
+        args = parser.parse_args()
+
+        if args.all:
+            args.ensemble = True
+            args.kelly = True
+            args.clv = True
+            args.live = True
+            args.polymarket = True
+            args.polymarket_live = True
+
+        odds_cache = OddsCache(sportsbook=args.odds) if args.odds else None
+
+        if args.league == 'wnba':
+            run_wnba(args, odds_cache=odds_cache)
+        else:
+            main(args, odds_cache=odds_cache)
+    else:
+        interactive_menu()

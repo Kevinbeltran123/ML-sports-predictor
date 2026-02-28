@@ -20,6 +20,7 @@ Estructura de un action de nba_api.live:
     }
 """
 
+import math
 import re
 from typing import Optional
 
@@ -102,9 +103,13 @@ class LivePBPTracker:
         self._plays = plays
 
     def get_features(self, period_end: int) -> dict:
-        """Retorna dict con 17 PBP features acumulativas hasta period_end.
+        """Retorna dict con 20 PBP features acumulativas hasta period_end.
 
-        Mismos nombres que PBP_FEATURE_COLS en ingame_dataset.py.
+        17 PBP originales + 3 score-context features para corregir home bias:
+        - SCORE_DIFF_NORMALIZED: score_diff / max(total_points, 1) — contexto de ventaja
+        - BLOWOUT_FLAG: 1.0 si abs(score_diff) > 15 — indica juego fuera de alcance
+        - SCORE_DIFF_X_MOMENTUM: momentum * sigmoid(score_diff/10) — interaccion que
+          reduce el peso del momentum cuando el juego ya esta decidido
         """
         # Filtrar plays hasta el periodo solicitado
         plays = [p for p in self._plays if p["period"] <= period_end]
@@ -159,6 +164,28 @@ class LivePBPTracker:
         current_q_plays = [p for p in plays if p["period"] == period_end]
         last_5_diff = self._compute_last_5min_diff(current_q_plays)
 
+        # --- Score context features (fix home bias) ---
+        last_home = plays[-1]["home_score"]
+        last_away = plays[-1]["away_score"]
+        score_diff = last_home - last_away
+        total_pts = last_home + last_away
+
+        # Normalized score differential: [-1, 1] range
+        score_diff_norm = score_diff / max(total_pts, 1)
+
+        # Blowout flag: game is out of reach
+        blowout = 1.0 if abs(score_diff) > 15 else 0.0
+
+        # Interaction: momentum attenuated by score context
+        # sigmoid(score_diff/10) maps diff to [0,1] — when home leads big,
+        # momentum from home is expected (less signal); when home trails,
+        # positive momentum is more meaningful
+        sigmoid_diff = 1.0 / (1.0 + math.exp(-score_diff / 10.0))
+        # When home leads big (sigmoid~1), positive momentum means less
+        # When home trails (sigmoid~0), positive momentum means more
+        # Flip: multiply momentum by (1 - sigmoid) so momentum matters more when trailing
+        score_diff_x_momentum = momentum * (1.0 - sigmoid_diff)
+
         return {
             "PBP_LEAD_CHANGES": lead_changes,
             "PBP_LARGEST_LEAD_HOME": largest_home,
@@ -177,6 +204,9 @@ class LivePBPTracker:
             "PBP_FG3_MADE_AWAY": fg3_away,
             "PBP_OREB_HOME": oreb_home,
             "PBP_OREB_AWAY": oreb_away,
+            "PBP_SCORE_DIFF_NORM": score_diff_norm,
+            "PBP_BLOWOUT_FLAG": blowout,
+            "PBP_SCORE_DIFF_X_MOMENTUM": score_diff_x_momentum,
         }
 
     # --- Funciones internas (réplica de create_pbp_features.py) ---
@@ -276,4 +306,7 @@ class LivePBPTracker:
             "PBP_FG3_MADE_AWAY": 0,
             "PBP_OREB_HOME": 0,
             "PBP_OREB_AWAY": 0,
+            "PBP_SCORE_DIFF_NORM": 0.0,
+            "PBP_BLOWOUT_FLAG": 0.0,
+            "PBP_SCORE_DIFF_X_MOMENTUM": 0.0,
         }

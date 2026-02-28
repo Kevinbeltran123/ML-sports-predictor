@@ -67,12 +67,18 @@ NBA_ML_MODELS_DIR = MODELS_DIR / "moneyline"
 # Aliases de compatibilidad
 XGBOOST_MODELS_DIR = NBA_ML_MODELS_DIR
 CATBOOST_MODELS_DIR = NBA_ML_MODELS_DIR
-# Stubs para runners no-W/L (totals, margin — no usados en este proyecto)
+# Totals and margin models
 NBA_UO_MODELS_DIR = MODELS_DIR / "totals"
 NBA_MARGIN_MODELS_DIR = MODELS_DIR / "margin"
 
 # --- Datos de entrenamiento ---
 TRAINING_DIR = DATA_DIR / "training"
+
+# --- WNBA ---
+WNBA_ML_MODELS_DIR = MODELS_DIR / "wnba" / "moneyline"
+WNBA_TEAMS_DB = TRAINING_DIR / "WNBATeamData.sqlite"
+WNBA_DATASET_DB = TRAINING_DIR / "wnba_dataset.sqlite"
+WNBA_BETS_DB = DATA_DIR / "nba" / "predictions" / "WNBABetsTracking.sqlite"
 
 # --- Bases de datos SQLite ---
 TEAMS_DB   = TRAINING_DIR / "TeamData.sqlite"
@@ -92,8 +98,14 @@ HISTORICAL_LINES_DB = RESEARCH_DIR / "HistoricalLines.sqlite"
 BETS_DB             = PREDICTIONS_DIR / "BetsTracking.sqlite"
 INGAME_MODELS_DIR   = MODELS_DIR / "ingame"
 
+# --- Polymarket ---
+POLYMARKET_DB = PREDICTIONS_DIR / "PolymarketTracking.sqlite"
+POLYMARKET_DEFAULT_BANKROLL = 50.0
+
 # Bases de datos opcionales (para features avanzadas)
-LINEUP_DB    = TRAINING_DIR / "LineupData.sqlite"
+LINEUP_DB     = TRAINING_DIR / "LineupData.sqlite"
+REFEREE_DB    = TRAINING_DIR / "RefereeData.sqlite"
+ARCHETYPES_MODEL_PATH = MODELS_DIR / "archetypes"
 ESPN_LINES_DB = SCRAPERS_DIR / "ESPNLines.sqlite"
 _bref_new    = SCRAPERS_DIR / "BRefData.sqlite"
 BREF_DB = (

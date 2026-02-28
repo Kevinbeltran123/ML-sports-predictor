@@ -27,6 +27,8 @@ from datetime import date as _date
 from datetime import timedelta
 
 import numpy as np
+from pathlib import Path
+
 import pandas as pd
 
 from src.config import ESPN_LINES_DB, get_logger
@@ -77,6 +79,10 @@ def build_espn_consensus_history(espn_db_path=None):
         espn_db_path = ESPN_LINES_DB
 
     lookup = {}
+
+    if not Path(espn_db_path).exists():
+        logger.warning("ESPNLines.sqlite no existe en %s — ESPN consensus deshabilitado", espn_db_path)
+        return lookup
 
     with sqlite3.connect(espn_db_path) as con:
         for season in ESPNLINES_SEASONS:
@@ -131,6 +137,10 @@ def build_espn_book_disagreement_history(espn_db_path=None):
         espn_db_path = ESPN_LINES_DB
 
     lookup = {}
+
+    if not Path(espn_db_path).exists():
+        logger.warning("ESPNLines.sqlite no existe — book disagreement deshabilitado")
+        return lookup
 
     with sqlite3.connect(espn_db_path) as con:
         for season in BOOK_DISAGREEMENT_SEASONS:

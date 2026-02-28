@@ -809,3 +809,35 @@ def add_extended_fatigue_to_frame(frame, features_list):
 
     ext_df = pd.DataFrame(features_list, index=frame.index)
     return pd.concat([frame, ext_df], axis=1)
+
+
+# ── Phase 5.5: Interaction features (B2B × Travel combos) ──────────
+
+
+def add_fatigue_combo_to_frame(frame):
+    """Agrega interaction features de fatiga × viaje al DataFrame.
+
+    Requiere que las columnas base ya existan en el frame:
+        TWO_IN_THREE_*, TRAVEL_DIST_*, TZ_CHANGE_*, GAMES_IN_7_*, TRAVEL_7D_*
+
+    Nuevas features (6 columnas):
+        B2B_TRAVEL_HOME/AWAY  — B2B con viaje largo (TWO_IN_THREE × TRAVEL_DIST)
+        B2B_TZ_HOME/AWAY      — B2B con jet lag (TWO_IN_THREE × |TZ_CHANGE|)
+        FATIGUE_INDEX_HOME/AWAY — densidad + distancia (GAMES_IN_7 × TRAVEL_7D / 1000)
+
+    Args:
+        frame: DataFrame con features de fatiga y viaje ya agregadas
+
+    Returns:
+        DataFrame con 6 columnas nuevas de interacción
+    """
+    frame["B2B_TRAVEL_HOME"] = frame["TWO_IN_THREE_HOME"] * frame["TRAVEL_DIST_HOME"]
+    frame["B2B_TRAVEL_AWAY"] = frame["TWO_IN_THREE_AWAY"] * frame["TRAVEL_DIST_AWAY"]
+
+    frame["B2B_TZ_HOME"] = frame["TWO_IN_THREE_HOME"] * frame["TZ_CHANGE_HOME"].abs()
+    frame["B2B_TZ_AWAY"] = frame["TWO_IN_THREE_AWAY"] * frame["TZ_CHANGE_AWAY"].abs()
+
+    frame["FATIGUE_INDEX_HOME"] = frame["GAMES_IN_7_HOME"] * frame["TRAVEL_7D_HOME"] / 1000
+    frame["FATIGUE_INDEX_AWAY"] = frame["GAMES_IN_7_AWAY"] * frame["TRAVEL_7D_AWAY"] / 1000
+
+    return frame

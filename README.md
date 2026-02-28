@@ -1,12 +1,76 @@
 # NBA W/L Predictor
 
-Standalone NBA moneyline predictor. Ensemble of XGBoost (60%) + CatBoost (40%) achieving **66.38% accuracy** on 809-game test set (2025-26 season).
+Standalone NBA moneyline predictor. Ensemble of XGBoost (60%) + CatBoost (40%) achieving **~66.4% accuracy** on 809-game test set (2025-26 season). In-game cascade models update predictions after each quarter using real-time play-by-play data.
 
 ## Quick Start
 
 ```bash
 conda activate nba-betting-312
+
+# Interactive menu (recommended) — guides you through all options
+PYTHONPATH=. python predictor.py
+
+# Or with CLI flags directly
 PYTHONPATH=. python predictor.py -ensemble -odds fanduel -kelly
+```
+
+### Interactive Menu
+
+Running `python predictor.py` without flags launches an interactive menu:
+
+```
+==================================================
+  NBA W/L Predictor
+==================================================
+
+  Liga:
+    1) NBA
+    2) WNBA
+
+  Sportsbook:
+    1) fanduel (default)
+    2) draftkings
+    3) betmgm
+    4) pointsbet
+    5) caesars
+    6) wynn
+    7) bet_rivers_ny
+
+  Modelo:
+    1) Ensemble XGB 60% + CatBoost 40% (default)
+    2) XGBoost solo
+
+  Features adicionales:
+    1) CLV report
+    2) Live betting (Q1-Q3)
+    3) Polymarket
+    4) Ninguno
+```
+
+### CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `-ensemble` | Run XGB+CatBoost ensemble (recommended) |
+| `-xgb` | Run XGBoost solo |
+| `-odds BOOK` | Fetch odds: `fanduel`, `draftkings`, `betmgm`, `caesars`, `wynn`, `bet_rivers_ny` |
+| `-kelly` | Show Kelly criterion bankroll sizing |
+| `-clv` | Print CLV (Closing Line Value) report |
+| `--live` | Activate live betting session (Q1-Q3 polling) |
+| `--polymarket` | Polymarket trading signals |
+| `--polymarket-live` | Live position management on Polymarket |
+| `--execute` | Execute real Polymarket orders (requires confirmation) |
+| `--bankroll-usdc N` | Polymarket bankroll in USDC |
+| `--league nba/wnba` | Select league (default: nba) |
+| `--all` | Run all modes (ensemble + kelly + live) |
+
+```bash
+# Common usage examples
+PYTHONPATH=. python predictor.py -ensemble -odds fanduel -kelly          # daily picks
+PYTHONPATH=. python predictor.py -ensemble -odds fanduel -kelly --live   # daily + live Q updates
+PYTHONPATH=. python predictor.py --all                                    # everything
+PYTHONPATH=. python predictor.py -ensemble -odds draftkings -kelly -clv  # with CLV report
+PYTHONPATH=. python predictor.py --league wnba -ensemble -odds fanduel   # WNBA picks
 ```
 
 ## How It Works
@@ -16,6 +80,7 @@ PYTHONPATH=. python predictor.py -ensemble -odds fanduel -kelly
 3. Engineers 158 features (after ablation pruning from 218)
 4. Runs XGBoost + CatBoost ensemble with weighted average
 5. Outputs picks ranked by Expected Value with Kelly sizing
+6. (Live mode) Polls quarter scores and runs in-game cascade for updated probabilities
 
 ## Console Output
 
@@ -55,15 +120,30 @@ Each game is shown as a compact block, ranked by EV (best first):
 
 ## Models
 
+### Pregame Ensemble
+
 | Model | Type | Accuracy | Location |
 |-------|------|----------|----------|
-| XGBoost | Moneyline | 65.0% | `models/moneyline/` |
-| CatBoost | Moneyline | 65.9% | `models/moneyline/` |
-| Ensemble | Weighted avg | 66.38% | Runtime (60/40) |
+| XGBoost | Moneyline | 64.9% | `models/moneyline/` |
+| CatBoost | Moneyline | 66.3% | `models/moneyline/` |
+| Ensemble | Weighted avg | ~66.4% | Runtime (60/40) |
 | XGB variance | Per-game σ | — | `models/moneyline/ensemble_variance.json` |
 | Conformal | Bet filter | — | `models/moneyline/ensemble_conformal.pkl` |
-| In-game XGB | Q1/Q2/Q3 | 68.9-78.8% | `models/ingame/` |
-| In-game Logistic | Q1/Q2/Q3 | 67.2-77.4% | `models/ingame/` |
+
+### In-Game Cascade v2 (trained on 8,260 games / 24,780 rows)
+
+Three-level cascade per quarter, falling back gracefully:
+
+| Level | Model | Q1 | Q2 | Q3 | Features |
+|-------|-------|----|----|-----|----------|
+| 2 | XGBoost + Platt | 65.2% | 71.7% | 81.5% | 21 (PBP + score-context) |
+| 1 | Logistic | 65.2% | 71.7% | 79.8% | 12 (PBP subset + score-context) |
+| 0 | Bayesian | — | — | — | score_diff + possessions |
+
+**Training data:** 7 NBA seasons (2019-20 through 2025-26), Regular Season + Playoffs.
+PBP data sourced from `cdn.nba.com` (public, no auth required).
+
+**PBP Features (20):** Lead changes, largest leads, scoring runs, timeouts, fouls, turnovers, momentum, last-5-min differential, 3PT made, offensive rebounds, plus score-context features (normalized diff, blowout flag, attenuated momentum).
 
 ## Features (158 after ablation)
 
@@ -102,25 +182,30 @@ PYTHONPATH=. python predictor.py -ensemble -odds fanduel -kelly --live
 ```
 
 Polls Q1/Q2/Q3 scores every 30s. Three-level cascade:
-- Level 2: XGB in-game models (best accuracy)
-- Level 1: Logistic regression (fallback)
+- Level 2: XGB in-game models (best accuracy, requires PBP data)
+- Level 1: Logistic regression (fallback, requires PBP data)
 - Level 0: Bayesian adjustment (β=0.45, always available)
 
-## CLI Flags
+## Training In-Game Models
 
-| Flag | Description |
-|------|-------------|
-| `-ensemble` | Run XGB+CatBoost ensemble (recommended) |
-| `-xgb` | Run XGBoost solo |
-| `-odds BOOK` | Fetch odds: `fanduel`, `draftkings`, `betmgm`, `caesars`, `wynn`, `bet_rivers_ny` |
-| `-kelly` | Show Kelly criterion bankroll sizing |
-| `-clv` | Print CLV (Closing Line Value) report |
-| `--live` | Activate live betting session (Q1-Q3 polling) |
+```bash
+# Full pipeline: collect PBP + train (resumable, checkpoints every 100 games)
+PYTHONPATH=. python scripts/train_ingame_models.py
+
+# Specific seasons
+PYTHONPATH=. python scripts/train_ingame_models.py --seasons 2023-24 2024-25
+
+# Retrain only (skip PBP collection)
+PYTHONPATH=. python scripts/train_ingame_models.py --skip-collect
+```
+
+Data is fetched from `stats.nba.com` (game schedules) and `cdn.nba.com` (play-by-play).
+Both are public endpoints — no API key needed. Rate limited to 0.3s between PBP requests.
 
 ## Project Structure
 
 ```
-predictor.py                  # Entry point
+predictor.py                  # Entry point (interactive menu)
 config.toml                   # Season dates and data config
 src/
   config.py                   # Paths, DROP_COLUMNS_ML (158 features)
@@ -129,15 +214,30 @@ src/
     calibration/              # Conformal, Platt scaling, ECE
     ensemble/                 # MWUA, stacking, evaluation
     stats/                    # ELO ratings, rolling averages
+    odds_cache.py             # Single-fetch cache for OddsApiProvider
   sports/nba/
-    features/                 # 20 feature modules
+    features/                 # 20+ feature modules
+      live_pbp_tracker.py     # Real-time PBP feature extraction
     predict/                  # Ensemble runner, XGB runner, in-game, live betting, margin
+      ingame_runner.py        # In-game cascade: XGBoost → Logistic → Bayesian
+      live_betting.py         # Live session polling + cascade trigger
     providers/                # Odds API integration
 models/
   moneyline/                  # XGB, CatBoost, conformal, variance models
-  ingame/                     # Q1/Q2/Q3 cascade models
-data/training/                # TeamData, OddsData, dataset SQLite
-scripts/                      # Closing lines collection, conformal fitting
+  ingame/                     # Q1/Q2/Q3 cascade models (XGB, Logistic, calibration, conformal)
+  margin/                     # Margin regression models (optional)
+  totals/                     # Over/Under models (optional)
+data/
+  training/                   # TeamData, OddsData, dataset, PBPFeatures SQLite
+  nba/predictions/            # BetsTracking.sqlite, live_bets.csv
+  nba/research/               # HistoricalLines.sqlite
+  nba/schedules/              # Season schedule CSV
+scripts/
+  train_ingame_models.py      # PBP collection + in-game model training
+  train_models.py             # Pregame moneyline model training
+  train_margin_models.py      # Margin regression training
+  train_totals_models.py      # Over/Under model training
+  collect_closing_lines.py    # CLV analysis data collection
 ```
 
 ## Requirements

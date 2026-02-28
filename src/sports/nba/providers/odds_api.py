@@ -31,7 +31,8 @@ ALL_PROP_MARKETS = BASIC_PROP_MARKETS + [
     "player_blocks_steals",
 ]
 
-ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+ODDS_API_URL = ODDS_API_BASE.format(sport="basketball_nba")
 
 # Umbral de alerta: si quedan menos del 10% de creditos, loguear WARNING
 QUOTA_WARNING_THRESHOLD = 2_000  # 10% de 20,000 creditos del plan $30
@@ -39,12 +40,16 @@ QUOTA_WARNING_THRESHOLD = 2_000  # 10% de 20,000 creditos del plan $30
 
 class OddsApiProvider:
 
-    def __init__(self, sportsbook="fanduel", api_key=None):
+    def __init__(self, sportsbook="fanduel", api_key=None, sport="basketball_nba"):
         self.api_key = api_key or os.environ.get("ODDS_API_KEY")
         if not self.api_key:
             raise ValueError("ODDS_API_KEY not set. Pass api_key or set the ODDS_API_KEY environment variable.")
         self.sportsbook = sportsbook
         self.bookmaker_key = BOOKMAKER_MAP.get(sportsbook, sportsbook)
+        self.sport = sport
+        self._odds_url = ODDS_API_BASE.format(sport=sport)
+        self._events_url = f"https://api.the-odds-api.com/v4/sports/{sport}/events/"
+        self._event_odds_url = f"https://api.the-odds-api.com/v4/sports/{sport}/events/{{event_id}}/odds/"
 
         # Quota tracking: se actualiza con cada request a la API
         # x-requests-remaining = creditos disponibles este mes
@@ -110,7 +115,7 @@ class OddsApiProvider:
             'oddsFormat': 'american',
             'bookmakers': self.bookmaker_key,
         }
-        resp = requests.get(ODDS_API_URL, params=params, timeout=15)
+        resp = requests.get(self._odds_url, params=params, timeout=15)
         resp.raise_for_status()
         self._update_quota(resp)
         events = resp.json()
@@ -138,6 +143,8 @@ class OddsApiProvider:
             money_line_home = None
             money_line_away = None
             totals_value = None
+            over_odds = None
+            under_odds = None
             # Convención canónica del proyecto: spread del local (home spread).
             spread_home = None
             spread_home_price = None
@@ -158,6 +165,9 @@ class OddsApiProvider:
                         for outcome in market['outcomes']:
                             if outcome['name'] == 'Over':
                                 totals_value = outcome.get('point')
+                                over_odds = outcome.get('price')
+                            elif outcome['name'] == 'Under':
+                                under_odds = outcome.get('price')
                     elif market['key'] == 'spreads':
                         for outcome in market['outcomes']:
                             name = outcome['name'].replace("Los Angeles Clippers", "LA Clippers")
@@ -172,6 +182,8 @@ class OddsApiProvider:
 
             dict_res[f"{home_team}:{away_team}"] = {
                 'under_over_odds': totals_value,
+                'over_odds': over_odds,
+                'under_odds': under_odds,
                 # spread < 0: local favorito | spread > 0: local underdog
                 'spread': spread_home if spread_home is not None else 0.0,
                 # Odds del spread (americanas). Default -110 si no disponible.
@@ -199,8 +211,7 @@ class OddsApiProvider:
         params = {
             'apiKey': self.api_key,
         }
-        url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/"
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(self._events_url, params=params, timeout=15)
         resp.raise_for_status()
         self._update_quota(resp)
         events = resp.json()
@@ -235,7 +246,7 @@ class OddsApiProvider:
         if markets is None:
             markets = BASIC_PROP_MARKETS
 
-        url = ODDS_API_EVENT_URL.format(event_id=event_id)
+        url = self._event_odds_url.format(event_id=event_id)
         params = {
             'apiKey':      self.api_key,
             'regions':     'us',
@@ -347,7 +358,7 @@ class OddsApiProvider:
         if markets is None:
             markets = BASIC_PROP_MARKETS
 
-        url = ODDS_API_EVENT_URL.format(event_id=event_id)
+        url = self._event_odds_url.format(event_id=event_id)
         params = {
             'apiKey': self.api_key,
             'regions': 'us',
@@ -534,7 +545,7 @@ class OddsApiProvider:
         if markets is None:
             markets = BASIC_PROP_MARKETS
 
-        url = ODDS_API_EVENT_URL.format(event_id=event_id)
+        url = self._event_odds_url.format(event_id=event_id)
         params = {
             'apiKey':      self.api_key,
             'regions':     'us',
