@@ -1,6 +1,6 @@
 # NBA W/L Predictor
 
-Standalone NBA moneyline predictor. Ensemble of XGBoost (60%) + CatBoost (40%) achieving **~66.4% accuracy** on 809-game test set (2025-26 season). In-game cascade models update predictions after each quarter using real-time play-by-play data.
+Standalone NBA moneyline predictor. Ensemble of XGBoost (95%) + CatBoost (5%) achieving **~65.0% accuracy** on 809-game test set (2025-26 season), Optuna-tuned for calibration (ECE=0.031). First Half (1H) model at 62.3%. In-game cascade models update predictions after each quarter using real-time play-by-play data.
 
 ## Quick Start
 
@@ -56,6 +56,7 @@ Running `python predictor.py` without flags launches an interactive menu:
 | `-odds BOOK` | Fetch odds: `fanduel`, `draftkings`, `betmgm`, `caesars`, `wynn`, `bet_rivers_ny` |
 | `-kelly` | Show Kelly criterion bankroll sizing |
 | `-clv` | Print CLV (Closing Line Value) report |
+| `--h1` | Show First Half (1H) moneyline predictions |
 | `--live` | Activate live betting session (Q1-Q3 polling) |
 | `--polymarket` | Polymarket trading signals |
 | `--polymarket-live` | Live position management on Polymarket |
@@ -77,7 +78,7 @@ PYTHONPATH=. python predictor.py --league wnba -ensemble -odds fanduel   # WNBA 
 
 1. Fetches today's NBA odds from The Odds API
 2. Pulls current team stats from nba.com + historical data from SQLite
-3. Engineers 158 features (after ablation pruning from 218)
+3. Engineers 188 features (after ablation pruning from 218, plus Four Factors + market features)
 4. Runs XGBoost + CatBoost ensemble with weighted average
 5. Outputs picks ranked by Expected Value with Kelly sizing
 6. (Live mode) Polls quarter scores and runs in-game cascade for updated probabilities
@@ -124,9 +125,9 @@ Each game is shown as a compact block, ranked by EV (best first):
 
 | Model | Type | Accuracy | Location |
 |-------|------|----------|----------|
-| XGBoost | Moneyline | 64.9% | `models/moneyline/` |
-| CatBoost | Moneyline | 66.3% | `models/moneyline/` |
-| Ensemble | Weighted avg | ~66.4% | Runtime (60/40) |
+| XGBoost | Moneyline | 65.0% | `models/moneyline/` |
+| CatBoost | Moneyline | 65.9% | `models/moneyline/` |
+| Ensemble | Weighted avg | ~65.0% | Runtime (95/5 Optuna-tuned) |
 | XGB variance | Per-game σ | — | `models/moneyline/ensemble_variance.json` |
 | Conformal | Bet filter | — | `models/moneyline/ensemble_conformal.pkl` |
 
@@ -145,7 +146,26 @@ PBP data sourced from `cdn.nba.com` (public, no auth required).
 
 **PBP Features (20):** Lead changes, largest leads, scoring runs, timeouts, fouls, turnovers, momentum, last-5-min differential, 3PT made, offensive rebounds, plus score-context features (normalized diff, blowout flag, attenuated momentum).
 
-## Features (158 after ablation)
+### First Half (1H) Moneyline
+
+| Model | Accuracy | Location |
+|-------|----------|----------|
+| XGBoost | 61.7% | `models/h1moneyline/` |
+| CatBoost | 62.3% | `models/h1moneyline/` |
+| Ensemble | 62.3% (Cat 100%) | Runtime |
+
+Same 188 pregame features, different target: H1-Home-Win (who leads at halftime).
+Trained on 4,052 games with halftime scores (2019-2026). Baseline ~51.8%.
+
+```bash
+# Daily picks with 1H predictions
+PYTHONPATH=. python predictor.py -ensemble -odds fanduel -kelly --h1
+
+# Train H1 models
+PYTHONPATH=. python scripts/train_h1_models.py
+```
+
+## Features (188)
 
 Engineered from `src/sports/nba/features/`:
 
@@ -161,7 +181,8 @@ Engineered from `src/sports/nba/features/`:
 - **Strength of schedule** — Opponent quality over last 10
 - **Injury impact** — AVAIL_QUALITY (weighted availability from injury reports)
 - **Lineup strength** — TOP5 plus/minus, depth score, star power, HHI minutes
-- **Market** — Devigged ML probability from sportsbook odds
+- **Four Factors** — eFG%, TOV%, ORB%, FT/FGA, Pace, ORtg (rolling 10-game, T-1 strict)
+- **Market** — Devigged ML probability, VIG_MAGNITUDE (bookmaker overround)
 
 Dropped by ablation: shot chart zones, ESPN line moves, on/off ratings, referee tendencies, granular injury fields, lineup composition metrics.
 
@@ -208,7 +229,7 @@ Both are public endpoints — no API key needed. Rate limited to 0.3s between PB
 predictor.py                  # Entry point (interactive menu)
 config.toml                   # Season dates and data config
 src/
-  config.py                   # Paths, DROP_COLUMNS_ML (158 features)
+  config.py                   # Paths, DROP_COLUMNS_ML (188 features)
   core/
     betting/                  # Kelly, EV, spread math, bet tracker, CLV
     calibration/              # Conformal, Platt scaling, ECE
@@ -224,6 +245,7 @@ src/
     providers/                # Odds API integration
 models/
   moneyline/                  # XGB, CatBoost, conformal, variance models
+  h1moneyline/                # First Half moneyline models (XGB, CatBoost, conformal)
   ingame/                     # Q1/Q2/Q3 cascade models (XGB, Logistic, calibration, conformal)
   margin/                     # Margin regression models (optional)
   totals/                     # Over/Under models (optional)
@@ -235,8 +257,11 @@ data/
 scripts/
   train_ingame_models.py      # PBP collection + in-game model training
   train_models.py             # Pregame moneyline model training
+  train_h1_models.py          # First Half moneyline model training
   train_margin_models.py      # Margin regression training
   train_totals_models.py      # Over/Under model training
+  collect_halftime_scores.py  # CDN boxscore halftime data collection
+  build_h1_dataset.py         # H1 target column builder
   collect_closing_lines.py    # CLV analysis data collection
 ```
 

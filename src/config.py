@@ -67,6 +67,8 @@ NBA_ML_MODELS_DIR = MODELS_DIR / "moneyline"
 # Aliases de compatibilidad
 XGBOOST_MODELS_DIR = NBA_ML_MODELS_DIR
 CATBOOST_MODELS_DIR = NBA_ML_MODELS_DIR
+# H1 (First Half) moneyline
+NBA_H1_MODELS_DIR = MODELS_DIR / "h1moneyline"
 # Totals and margin models
 NBA_UO_MODELS_DIR = MODELS_DIR / "totals"
 NBA_MARGIN_MODELS_DIR = MODELS_DIR / "margin"
@@ -121,7 +123,7 @@ CONFIG_PATH = PROJECT_ROOT / "config.toml"
 # 158 features finales tras ablacion Feb-2026.
 DROP_COLUMNS_ML = [
     # --- Metadata y targets ---
-    "index", "Score", "Home-Team-Win", "Margin", "TEAM_NAME", "Date",
+    "index", "Score", "Home-Team-Win", "H1-Home-Win", "Margin", "TEAM_NAME", "Date",
     "index.1", "TEAM_NAME.1", "Date.1", "OU-Cover", "OU",
     # --- Feature Selection original: redundancia manual ---
     "Net_Rtg", "Net_Rtg.1",

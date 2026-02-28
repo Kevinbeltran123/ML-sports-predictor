@@ -128,11 +128,19 @@ class OddsApiProvider:
         params = {
             'apiKey': self.api_key,
             'regions': 'us',
-            'markets': 'h2h,totals,spreads',
+            'markets': 'h2h,totals,spreads,h2h_h1',
             'oddsFormat': 'american',
             'bookmakers': self.bookmaker_key,
         }
-        resp = _request_with_retry(self._odds_url, params=params)
+        try:
+            resp = _request_with_retry(self._odds_url, params=params)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 422:
+                logger.warning("h2h_h1 market not available, falling back without it")
+                params['markets'] = 'h2h,totals,spreads'
+                resp = _request_with_retry(self._odds_url, params=params)
+            else:
+                raise
         self._update_quota(resp)
         events = resp.json()
 
@@ -165,6 +173,9 @@ class OddsApiProvider:
             spread_home = None
             spread_home_price = None
             spread_away_price = None
+            # First Half moneyline
+            h1_ml_home = None
+            h1_ml_away = None
 
             for bookmaker in event.get('bookmakers', []):
                 if bookmaker['key'] != self.bookmaker_key:
@@ -177,6 +188,13 @@ class OddsApiProvider:
                                 money_line_home = outcome['price']
                             elif name == away_team:
                                 money_line_away = outcome['price']
+                    elif market['key'] == 'h2h_h1':
+                        for outcome in market['outcomes']:
+                            name = outcome['name'].replace("Los Angeles Clippers", "LA Clippers")
+                            if name == home_team:
+                                h1_ml_home = outcome['price']
+                            elif name == away_team:
+                                h1_ml_away = outcome['price']
                     elif market['key'] == 'totals':
                         for outcome in market['outcomes']:
                             if outcome['name'] == 'Over':
@@ -205,6 +223,9 @@ class OddsApiProvider:
                 # Odds del spread (americanas). Default -110 si no disponible.
                 'spread_home_odds': spread_home_price if spread_home_price is not None else -110,
                 'spread_away_odds': spread_away_price if spread_away_price is not None else -110,
+                # First Half moneyline (None si no disponible)
+                'h1_ml_home': h1_ml_home,
+                'h1_ml_away': h1_ml_away,
                 home_team: {'money_line_odds': money_line_home},
                 away_team: {'money_line_odds': money_line_away},
             }

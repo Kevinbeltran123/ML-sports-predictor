@@ -74,6 +74,11 @@ from src.sports.nba.features.referee_features import (
     get_game_referee_features,
     add_referee_features_to_frame,
 )
+from src.sports.nba.features.bref_game_features import (
+    build_four_factors_history,
+    get_game_four_factors,
+    add_four_factors_to_frame,
+)
 from src.core.tools import (
     create_todays_games_from_odds,
     get_json_data,
@@ -258,7 +263,7 @@ def _build_game_base_row(df, home_team, away_team, home_rest, away_rest):
 
 
 def _add_market_features(games_df, spread_values, home_odds, away_odds):
-    """Agrega MARKET_SPREAD y MARKET_ML_PROB al DataFrame."""
+    """Agrega MARKET_SPREAD, MARKET_ML_PROB y VIG_MAGNITUDE al DataFrame."""
     games_df["MARKET_SPREAD"] = np.clip(
         np.asarray(spread_values, dtype=float), -25.0, 25.0
     )
@@ -267,6 +272,13 @@ def _add_market_features(games_df, spread_values, home_odds, away_odds):
         for h, a in zip(home_odds, away_odds)
     ]
     games_df["MARKET_ML_PROB"] = np.asarray(ml_probs)
+
+    from src.sports.nba.features.odds_features import compute_vig_magnitude
+    vig_vals = [
+        compute_vig_magnitude(h, a)
+        for h, a in zip(home_odds, away_odds)
+    ]
+    games_df["VIG_MAGNITUDE"] = np.asarray(vig_vals)
     return games_df
 
 
@@ -278,7 +290,14 @@ def _prepare_prediction_matrix(games_df):
     if "MARKET_ML_PROB" in games_df.columns:
         market_info["MARKET_ML_PROB"] = games_df["MARKET_ML_PROB"].values.copy()
 
+    # Diff_TS_PCT: debe calcularse antes del drop (TS_PCT está en DROP_COLUMNS_ML)
+    has_ts = "TS_PCT" in games_df.columns and "TS_PCT.1" in games_df.columns
+    if has_ts:
+        games_df["Diff_TS_PCT"] = games_df["TS_PCT"] - games_df["TS_PCT.1"]
+    logger.debug("Diff_TS_PCT: TS_PCT available=%s, Diff_TS_PCT in frame=%s", has_ts, "Diff_TS_PCT" in games_df.columns)
+
     frame_ml = games_df.drop(columns=PREDICTION_DROP, errors='ignore')
+    logger.info("Feature matrix: %d features", frame_ml.shape[1])
     return frame_ml.values.astype(float), frame_ml, market_info
 
 
@@ -287,7 +306,8 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
                              team_schedule, travel_schedule=None,
                              sos_lookup=None, srs_lookup=None,
                              lineup_lookup=None,
-                             ref_assignments=None, ref_history=None):
+                             ref_assignments=None, ref_history=None,
+                             ff_lookup=None):
     match_data = []
     todays_games_uo = []
     home_team_odds = []
@@ -307,6 +327,7 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     srs_features_list = []
     lineup_features_list = []
     referee_features_list = []
+    ff_features_list = []
 
     today_str = today.strftime("%Y-%m-%d")
 
@@ -443,6 +464,20 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
                 "REF_CREW_HOME_WIN_PCT": 0.54,
             })
 
+        if ff_lookup:
+            ff_features_list.append(
+                get_game_four_factors(ff_lookup, today_str, home_team, away_team)
+            )
+        else:
+            ff_features_list.append({
+                "FF_PACE_HOME": 100.0, "FF_PACE_AWAY": 100.0,
+                "FF_ORTG_HOME": 110.0, "FF_ORTG_AWAY": 110.0,
+                "FF_EFG_HOME": 0.50, "FF_EFG_AWAY": 0.50,
+                "FF_TOV_HOME": 13.0, "FF_TOV_AWAY": 13.0,
+                "FF_ORB_HOME": 25.0, "FF_ORB_AWAY": 25.0,
+                "FF_FT_FGA_HOME": 0.20, "FF_FT_FGA_AWAY": 0.20,
+            })
+
         match_data.append(stats)
 
     games_data_frame = pd.concat(match_data, ignore_index=True, axis=1).T
@@ -467,6 +502,7 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     games_data_frame = add_srs_features_to_frame(games_data_frame, srs_features_list)
     games_data_frame = add_lineup_features_to_frame(games_data_frame, lineup_features_list)
     games_data_frame = add_referee_features_to_frame(games_data_frame, referee_features_list)
+    games_data_frame = add_four_factors_to_frame(games_data_frame, ff_features_list)
 
     data, frame_ml, market_info = _prepare_prediction_matrix(games_data_frame)
 
@@ -538,6 +574,31 @@ def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team
             data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, use_kelly
         )
         print("-------------------------------------------------------")
+
+    # --- First Half (1H) predictions ---
+    if getattr(args, 'h1', False):
+        try:
+            from src.sports.nba.predict.h1_runner import predict_h1
+            # games is [[home, away], ...] — flatten for h1_runner
+            games_flat = [team for pair in games for team in pair]
+            # Extract H1 odds from odds data if available
+            h1_home_odds = []
+            h1_away_odds = []
+            if odds:
+                for home, away in games:
+                    key = f"{home}:{away}"
+                    game_odds = odds.get(key, {})
+                    h1_home_odds.append(game_odds.get('h1_ml_home'))
+                    h1_away_odds.append(game_odds.get('h1_ml_away'))
+            predict_h1(
+                data, games_flat,
+                h1_odds_home=h1_home_odds or None,
+                h1_odds_away=h1_away_odds or None,
+                kelly_flag=use_kelly,
+            )
+        except Exception as e:
+            logger.warning("H1 predictions failed: %s", e)
+
     return predictions
 
 
@@ -582,11 +643,14 @@ def main(args, odds_cache=None):
 
     ref_assignments, ref_history = build_referee_history()
 
+    ff_lookup = build_four_factors_history()
+
     data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds = create_todays_games_data(
         games, df, odds, schedule_df, today, game_logs, elo_ratings, split_data, team_availability, team_schedule,
         travel_schedule=travel_schedule, sos_lookup=sos_lookup,
         srs_lookup=srs_lookup, lineup_lookup=lineup_lookup,
         ref_assignments=ref_assignments, ref_history=ref_history,
+        ff_lookup=ff_lookup,
     )
 
     predictions = run_models(
@@ -801,11 +865,13 @@ def interactive_menu():
     print(f"    1) CLV report")
     print(f"    2) Live betting (Q1-Q3)")
     print(f"    3) Polymarket")
-    print(f"    4) Ninguno")
-    features_input = input(f"\n  Selecciona [4]: ").strip() or "4"
+    print(f"    4) First Half (1H) moneyline")
+    print(f"    5) Ninguno")
+    features_input = input(f"\n  Selecciona [5]: ").strip() or "5"
 
     use_clv = False
     use_live = False
+    use_h1 = False
     use_polymarket = False
     use_polymarket_live = False
     use_execute = False
@@ -814,12 +880,14 @@ def interactive_menu():
     if features_input.lower() == "all":
         use_clv = True
         use_live = True
+        use_h1 = True
         use_polymarket = True
     else:
         choices = [c.strip() for c in features_input.split(",")]
         use_clv = "1" in choices
         use_live = "2" in choices
         use_polymarket = "3" in choices
+        use_h1 = "4" in choices
 
     # --- Polymarket sub-options ---
     if use_polymarket:
@@ -858,6 +926,8 @@ def interactive_menu():
         extras.append("CLV")
     if use_live:
         extras.append("Live Q1-Q3")
+    if use_h1:
+        extras.append("1H Moneyline")
     if use_polymarket:
         pm_label = "Polymarket"
         if use_execute:
@@ -885,6 +955,7 @@ def interactive_menu():
         kelly=True,
         clv=use_clv,
         live=use_live,
+        h1=use_h1,
         polymarket=use_polymarket,
         polymarket_live=use_polymarket_live,
         execute=use_execute,
@@ -916,6 +987,7 @@ if __name__ == "__main__":
         parser.add_argument('-kelly', '--kelly', '-kc', dest='kelly', action='store_true',
                             help='Kelly stake (default on with ensemble)')
         parser.add_argument('-clv', action='store_true', help='CLV (Closing Line Value) report')
+        parser.add_argument('--h1', action='store_true', help='First Half (1H) moneyline predictions')
         parser.add_argument('--live', action='store_true', help='Live betting (polling Q1-Q3)')
         parser.add_argument('--polymarket', action='store_true', help='Polymarket trading signals')
         parser.add_argument('--polymarket-live', dest='polymarket_live', action='store_true',

@@ -80,42 +80,49 @@ def main():
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     h1["date"] = pd.to_datetime(h1["date"], errors="coerce")
 
-    # Normalize team names in dataset to tricodes
-    if "TEAM_NAME" in df.columns:
-        df["_home_tri"] = df["TEAM_NAME"].apply(_normalize_team)
-    elif "Home" in df.columns:
-        df["_home_tri"] = df["Home"].apply(_normalize_team)
-    else:
-        # Try to find team column
-        print("  ERROR: No team name column found in dataset")
-        return
+    # Map H1 tricodes to full team names for matching
+    h1["home_full"] = h1["home_team"].map(TRICODE_TO_FULL)
 
-    h1["_home_tri"] = h1["home_team"].apply(_normalize_team)
+    # Dataset dates are 1 day behind NBA API dates (schedule vs game date).
+    # Shift H1 dates back by 1 day to match dataset convention.
+    h1["_match_date"] = h1["date"] - pd.Timedelta(days=1)
 
-    # Create date string for matching
-    df["_date_str"] = df["Date"].dt.strftime("%Y-%m-%d")
-    h1["_date_str"] = h1["date"].dt.strftime("%Y-%m-%d")
+    # Build lookup: (date, full_team_name) -> h1_home_win
+    h1_lookup = {}
+    for _, row in h1.iterrows():
+        if pd.isna(row["_match_date"]) or pd.isna(row["home_full"]):
+            continue
+        key = (row["_match_date"].strftime("%Y-%m-%d"), row["home_full"])
+        h1_lookup[key] = int(row["h1_home_win"])
 
-    # Merge on (date, home_tricode)
-    h1_lookup = h1.set_index(["_date_str", "_home_tri"])["h1_home_win"].to_dict()
+    # Also try exact date match as fallback (some games may align)
+    for _, row in h1.iterrows():
+        if pd.isna(row["date"]) or pd.isna(row["home_full"]):
+            continue
+        key = (row["date"].strftime("%Y-%m-%d"), row["home_full"])
+        if key not in h1_lookup:
+            h1_lookup[key] = int(row["h1_home_win"])
+
+    print(f"  H1 lookup entries: {len(h1_lookup)}")
 
     matched = 0
-    ties = 0
     h1_values = []
+    df["_date_str"] = df["Date"].dt.strftime("%Y-%m-%d")
 
     for _, row in df.iterrows():
-        key = (row["_date_str"], row["_home_tri"])
+        home = row.get("TEAM_NAME", "")
+        key = (row["_date_str"], home)
         h1_win = h1_lookup.get(key)
         if h1_win is not None:
             matched += 1
-            h1_values.append(int(h1_win))
+            h1_values.append(h1_win)
         else:
             h1_values.append(np.nan)
 
     df["H1-Home-Win"] = h1_values
 
     # Drop temp columns
-    df = df.drop(columns=["_home_tri", "_date_str"], errors="ignore")
+    df = df.drop(columns=["_date_str"], errors="ignore")
 
     # Stats
     n_valid = df["H1-Home-Win"].notna().sum()
