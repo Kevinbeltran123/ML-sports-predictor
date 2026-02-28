@@ -275,10 +275,12 @@ def compute_clv_summary(min_date: Optional[str] = None) -> dict:
     con = sqlite3.connect(BETS_DB)
 
     query = "SELECT * FROM predictions WHERE clv_home IS NOT NULL"
+    params_sql = []
     if min_date:
-        query += f" AND game_date >= '{min_date}'"
+        query += " AND game_date >= ?"
+        params_sql.append(min_date)
 
-    df = pd.read_sql_query(query, con)
+    df = pd.read_sql_query(query, con, params=params_sql)
     con.close()
 
     if df.empty:
@@ -314,6 +316,18 @@ def compute_clv_summary(min_date: Optional[str] = None) -> dict:
         "date_range": f"{df['game_date'].min()} to {df['game_date'].max()}",
     }
 
+    # CLV ponderado por Kelly (apuestas grandes importan mas)
+    kelly_values = []
+    for _, row in df.iterrows():
+        if row.get("edge_home", 0) > row.get("edge_away", 0):
+            kelly_values.append(row.get("kelly_home", 0) or 0)
+        else:
+            kelly_values.append(row.get("kelly_away", 0) or 0)
+    kelly_arr = np.array(kelly_values)[valid]
+    if kelly_arr.sum() > 0:
+        weights = kelly_arr / kelly_arr.sum()
+        summary["clv_mean_weighted_pp"] = round(float(np.sum(clv_arr * weights) * 100), 2)
+
     # CLV por sportsbook
     df["clv_bet"] = clv_values
     by_book = df.groupby("sportsbook")["clv_bet"].agg(["mean", "count"])
@@ -322,17 +336,27 @@ def compute_clv_summary(min_date: Optional[str] = None) -> dict:
         for book, row in by_book.iterrows()
     }
 
-    # Correlacion CLV con resultado (deberia ser positiva si CLV predice ganancias)
+    # Correlacion CLV con resultado: pointbiserial (continuo vs binario)
     if "ml_correct" in df.columns:
         valid_correct = df["ml_correct"].notna()
         if valid_correct.sum() > 10:
-            from scipy.stats import pearsonr
-            r, p = pearsonr(
-                df.loc[valid_correct, "clv_bet"],
-                df.loc[valid_correct, "ml_correct"],
-            )
-            summary["clv_result_correlation"] = round(float(r), 3)
-            summary["clv_result_pvalue"] = round(float(p), 4)
+            try:
+                from scipy.stats import pointbiserialr
+                r, p = pointbiserialr(
+                    df.loc[valid_correct, "ml_correct"].astype(float),
+                    df.loc[valid_correct, "clv_bet"].astype(float),
+                )
+                summary["clv_result_correlation"] = round(float(r), 3)
+                summary["clv_result_pvalue"] = round(float(p), 4)
+            except Exception:
+                # Fallback a Pearson si pointbiserial no disponible
+                from scipy.stats import pearsonr
+                r, p = pearsonr(
+                    df.loc[valid_correct, "clv_bet"],
+                    df.loc[valid_correct, "ml_correct"],
+                )
+                summary["clv_result_correlation"] = round(float(r), 3)
+                summary["clv_result_pvalue"] = round(float(p), 4)
 
     return summary
 
@@ -351,10 +375,12 @@ def print_clv_report(min_date: Optional[str] = None):
     print(f"  Periodo: {summary['date_range']}")
     print(f"  Juegos evaluados: {summary['n_games']}")
     print()
-    print(f"  CLV promedio:  {summary['clv_mean_pp']:+.2f} pp")
-    print(f"  CLV mediana:   {summary['clv_median_pp']:+.2f} pp")
-    print(f"  CLV std dev:   {summary['clv_std_pp']:.2f} pp")
-    print(f"  % CLV positivo: {summary['pct_positive_clv']:.1f}%")
+    print(f"  CLV promedio:      {summary['clv_mean_pp']:+.2f} pp")
+    if "clv_mean_weighted_pp" in summary:
+        print(f"  CLV ponderado:     {summary['clv_mean_weighted_pp']:+.2f} pp (por Kelly size)")
+    print(f"  CLV mediana:       {summary['clv_median_pp']:+.2f} pp")
+    print(f"  CLV std dev:       {summary['clv_std_pp']:.2f} pp")
+    print(f"  % CLV positivo:    {summary['pct_positive_clv']:.1f}%")
     print()
 
     # Interpretacion

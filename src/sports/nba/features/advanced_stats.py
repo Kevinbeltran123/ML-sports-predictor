@@ -127,6 +127,11 @@ def add_advanced_features(frame):
     # Diff_FT_Rate: diferencial de tasa de tiros libres
     new_cols["Diff_FT_Rate"] = new_cols["FT_Rate"] - new_cols["FT_Rate.1"]
 
+    # Diff_TS_PCT: diferencial de True Shooting %
+    # TS% integra 2pts, 3pts y TL en una sola metrica de eficiencia.
+    # El diferencial captura ventaja/desventaja relativa de eficiencia de tiro.
+    new_cols["Diff_TS_PCT"] = new_cols["TS_PCT"] - new_cols["TS_PCT.1"]
+
     # Agregar todas las columnas de golpe (evita fragmentacion del DataFrame)
     new_df = pd.DataFrame(new_cols, index=frame.index)
     frame = pd.concat([frame, new_df], axis=1)

@@ -1,3 +1,7 @@
+import logging
+
+_logger = logging.getLogger(__name__)
+
 QUARTER_KELLY_FRACTION = 0.25
 EIGHTH_KELLY_FRACTION = 0.125
 DEFAULT_MAX_BET_PCT = 5.0       # cap para quarter-Kelly
@@ -79,7 +83,11 @@ def calculate_fractional_kelly(american_odds, model_prob, fraction=0.125,
     if kelly_full <= 0:
         return 0.0
     kelly_frac = round(kelly_full * fraction, 2)
-    return min(kelly_frac, max_bet_pct)
+    capped = min(kelly_frac, max_bet_pct)
+    if capped < kelly_frac:
+        _logger.debug("Kelly capped: %.2f%% → %.2f%% (full=%.2f%%, frac=%.3f)",
+                      kelly_frac, capped, kelly_full, fraction)
+    return capped
 
 
 def calculate_eighth_kelly(american_odds, model_prob, max_bet_pct=EIGHTH_MAX_BET_PCT):

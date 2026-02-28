@@ -1,9 +1,26 @@
 import logging
 import os
+import time
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _request_with_retry(url, params, max_retries=3, timeout=15):
+    """GET con exponential backoff para resiliencia ante errores transitorios."""
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            logger.warning("Odds API request failed (attempt %d/%d), retry in %ds: %s",
+                           attempt + 1, max_retries, wait, e)
+            time.sleep(wait)
 
 # URL base del endpoint de odds por evento (para player props necesitamos event_id)
 ODDS_API_EVENT_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds/"
@@ -115,8 +132,7 @@ class OddsApiProvider:
             'oddsFormat': 'american',
             'bookmakers': self.bookmaker_key,
         }
-        resp = requests.get(self._odds_url, params=params, timeout=15)
-        resp.raise_for_status()
+        resp = _request_with_retry(self._odds_url, params=params)
         self._update_quota(resp)
         events = resp.json()
 
@@ -211,8 +227,7 @@ class OddsApiProvider:
         params = {
             'apiKey': self.api_key,
         }
-        resp = requests.get(self._events_url, params=params, timeout=15)
-        resp.raise_for_status()
+        resp = _request_with_retry(self._events_url, params=params)
         self._update_quota(resp)
         events = resp.json()
 
@@ -256,8 +271,7 @@ class OddsApiProvider:
         }
 
         try:
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
+            resp = _request_with_retry(url, params=params)
             self._update_quota(resp)
             data = resp.json()
         except Exception as e:
@@ -342,8 +356,7 @@ class OddsApiProvider:
             'markets': markets,
             'oddsFormat': 'american',
         }
-        resp = requests.get(ODDS_API_URL, params=params, timeout=15)
-        resp.raise_for_status()
+        resp = _request_with_retry(ODDS_API_URL, params=params)
         self._update_quota(resp)
         return resp.json()
 
@@ -367,8 +380,7 @@ class OddsApiProvider:
         }
 
         try:
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
+            resp = _request_with_retry(url, params=params)
             self._update_quota(resp)
             return resp.json()
         except Exception as e:
@@ -412,8 +424,7 @@ class OddsApiProvider:
             'oddsFormat': 'american',
             # NO especificamos 'bookmakers' → retorna TODOS los disponibles
         }
-        resp = requests.get(ODDS_API_URL, params=params, timeout=15)
-        resp.raise_for_status()
+        resp = _request_with_retry(ODDS_API_URL, params=params)
         self._update_quota(resp)
         events = resp.json()
 
@@ -555,8 +566,7 @@ class OddsApiProvider:
         }
 
         try:
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
+            resp = _request_with_retry(url, params=params)
             self._update_quota(resp)
             data = resp.json()
         except Exception as e:

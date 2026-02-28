@@ -306,69 +306,16 @@ class BetTracker:
             print(f"  [BetTracker] No hay predicciones sin resultado para {game_date}")
             return
 
-        # Descargar resultados desde nba_api
+        # Descargar resultados — ESPN primero (mas rapido y confiable), nba_api como fallback
         print(f"  [BetTracker] Descargando resultados de {game_date}...")
-        try:
-            import time
-            time.sleep(0.6)  # respetar rate limit de stats.nba.com
-            finder = leaguegamefinder.LeagueGameFinder(
-                date_from_nullable=game_date,
-                date_to_nullable=game_date,
-                league_id_nullable="00"
-            )
-            games_df = finder.get_data_frames()[0]
-        except Exception as e:
-            print(f"  [BetTracker] ERROR descargando resultados: {e}")
+        results_by_teams = self._fetch_results_espn(game_date)
+
+        if not results_by_teams:
+            results_by_teams = self._fetch_results_nba_api(game_date, leaguegamefinder)
+
+        if not results_by_teams:
+            print(f"  [BetTracker] Sin resultados disponibles para {game_date}")
             return
-
-        if games_df.empty:
-            print(f"  [BetTracker] Sin resultados disponibles para {game_date} (¿partidos en curso?)")
-            return
-
-        # Agrupar por GAME_ID: cada game tiene 2 filas (home + away)
-        # Construir mapa: GAME_ID → {abbrev: score, ...}
-        game_scores = {}
-        for _, row in games_df.iterrows():
-            gid = row["GAME_ID"]
-            if gid not in game_scores:
-                game_scores[gid] = {}
-            game_scores[gid][row["TEAM_ABBREVIATION"]] = {
-                "pts": int(row["PTS"]) if row["PTS"] is not None else 0,
-                "wl": row["WL"],
-            }
-
-        # Determinar ganador y total para cada partido
-        # Nota: MATCHUP en nba_api tiene formato "BOS vs. MIA" (home) o "MIA @ BOS" (away)
-        # Podemos identificar home/away por el formato del MATCHUP
-        results_by_teams = {}
-        for gid, teams in game_scores.items():
-            if len(teams) != 2:
-                continue
-            abbrevs = list(teams.keys())
-            # Buscar cuál es home: la fila con MATCHUP "vs." es del equipo local
-            home_abbrev = None
-            for _, row in games_df[games_df["GAME_ID"] == gid].iterrows():
-                if "vs." in str(row.get("MATCHUP", "")):
-                    home_abbrev = row["TEAM_ABBREVIATION"]
-                    break
-
-            if home_abbrev is None:
-                continue
-
-            away_abbrev = [a for a in abbrevs if a != home_abbrev][0]
-            home_pts = teams[home_abbrev]["pts"]
-            away_pts = teams[away_abbrev]["pts"]
-
-            # Convertir abreviaciones a nombres completos
-            home_full = ABBREV_TO_FULL.get(home_abbrev, home_abbrev)
-            away_full = ABBREV_TO_FULL.get(away_abbrev, away_abbrev)
-
-            results_by_teams[(home_full, away_full)] = {
-                "home_score": home_pts,
-                "away_score": away_pts,
-                "total": home_pts + away_pts,
-                "winner": "HOME" if home_pts > away_pts else "AWAY",
-            }
 
         # Actualizar la DB
         updated = 0
@@ -425,6 +372,122 @@ class BetTracker:
         except Exception as e:
             print(f"  [BetTracker] CLV no disponible: {e}")
 
+    @staticmethod
+    def _fetch_results_espn(game_date: str) -> dict:
+        """Descarga scores desde ESPN API (publica, sin auth, rapida).
+
+        ESPN scoreboard endpoint retorna todos los juegos de una fecha
+        con home/away teams y scores finales.
+        """
+        import urllib.request
+        import json
+
+        # ESPN format: YYYYMMDD
+        dt = game_date.replace("-", "")
+        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={dt}"
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            print(f"  [BetTracker] ESPN API error: {e}")
+            return {}
+
+        results = {}
+        for event in data.get("events", []):
+            competition = event.get("competitions", [{}])[0]
+            competitors = competition.get("competitors", [])
+            if len(competitors) != 2:
+                continue
+
+            # ESPN: competitors[0] is usually home (homeAway field confirms)
+            home = away = None
+            for c in competitors:
+                team_name = c.get("team", {}).get("displayName", "")
+                score = int(c.get("score", 0))
+                if c.get("homeAway") == "home":
+                    home = {"name": team_name, "score": score}
+                else:
+                    away = {"name": team_name, "score": score}
+
+            if not home or not away:
+                continue
+
+            # Solo juegos finalizados
+            status = competition.get("status", {}).get("type", {}).get("completed", False)
+            if not status:
+                continue
+
+            results[(home["name"], away["name"])] = {
+                "home_score": home["score"],
+                "away_score": away["score"],
+                "total": home["score"] + away["score"],
+                "winner": "HOME" if home["score"] > away["score"] else "AWAY",
+            }
+
+        if results:
+            print(f"  [BetTracker] ESPN: {len(results)} juegos finalizados")
+        return results
+
+    @staticmethod
+    def _fetch_results_nba_api(game_date: str, leaguegamefinder) -> dict:
+        """Fallback: descarga scores desde stats.nba.com via nba_api."""
+        import time
+        try:
+            time.sleep(0.6)
+            finder = leaguegamefinder.LeagueGameFinder(
+                date_from_nullable=game_date,
+                date_to_nullable=game_date,
+                league_id_nullable="00"
+            )
+            games_df = finder.get_data_frames()[0]
+        except Exception as e:
+            print(f"  [BetTracker] nba_api error: {e}")
+            return {}
+
+        if games_df.empty:
+            return {}
+
+        game_scores = {}
+        for _, row in games_df.iterrows():
+            gid = row["GAME_ID"]
+            if gid not in game_scores:
+                game_scores[gid] = {}
+            game_scores[gid][row["TEAM_ABBREVIATION"]] = {
+                "pts": int(row["PTS"]) if row["PTS"] is not None else 0,
+                "wl": row["WL"],
+            }
+
+        results = {}
+        for gid, teams in game_scores.items():
+            if len(teams) != 2:
+                continue
+            home_abbrev = None
+            for _, row in games_df[games_df["GAME_ID"] == gid].iterrows():
+                if "vs." in str(row.get("MATCHUP", "")):
+                    home_abbrev = row["TEAM_ABBREVIATION"]
+                    break
+            if home_abbrev is None:
+                continue
+
+            away_abbrev = [a for a in list(teams.keys()) if a != home_abbrev][0]
+            home_pts = teams[home_abbrev]["pts"]
+            away_pts = teams[away_abbrev]["pts"]
+            home_full = ABBREV_TO_FULL.get(home_abbrev, home_abbrev)
+            away_full = ABBREV_TO_FULL.get(away_abbrev, away_abbrev)
+
+            results[(home_full, away_full)] = {
+                "home_score": home_pts,
+                "away_score": away_pts,
+                "total": home_pts + away_pts,
+                "winner": "HOME" if home_pts > away_pts else "AWAY",
+            }
+
+        if results:
+            print(f"  [BetTracker] nba_api: {len(results)} juegos encontrados")
+        return results
+
     def _find_result(self, home_team: str, away_team: str, results: dict) -> dict | None:
         """Busca el resultado para un partido usando match exacto o fuzzy.
 
@@ -439,8 +502,8 @@ class BetTracker:
         all_home_teams = [k[0] for k in results.keys()]
         all_away_teams = [k[1] for k in results.keys()]
 
-        home_matches = difflib.get_close_matches(home_team, all_home_teams, n=1, cutoff=0.7)
-        away_matches = difflib.get_close_matches(away_team, all_away_teams, n=1, cutoff=0.7)
+        home_matches = difflib.get_close_matches(home_team, all_home_teams, n=1, cutoff=0.85)
+        away_matches = difflib.get_close_matches(away_team, all_away_teams, n=1, cutoff=0.85)
 
         if home_matches and away_matches:
             key = (home_matches[0], away_matches[0])
@@ -514,6 +577,8 @@ class BetTracker:
             """, params).fetchall()
 
             # Simular P&L en apuestas con EV > 0
+            # Kelly % se usa como "unidades" (3.0% → 3.0 units)
+            # P&L es relativo: si tienes $1000 bankroll, 1 unit = $10
             pnl = 0.0
             n_bets = 0
             n_wins = 0
@@ -521,24 +586,31 @@ class BetTracker:
                 (home, away, date, ph, pa, ev_h, ev_a, kelly_h, kelly_a,
                  odds_h, odds_a, winner) = row
 
-                # Apostar al lado con EV positivo
-                if ev_h is not None and ev_h > 0 and kelly_h is not None and kelly_h > 0:
-                    units = kelly_h  # Quarter-Kelly ya aplicado en save_predictions
+                # Solo apostar al MEJOR lado (no ambos — ML es binario)
+                bet_home = (ev_h or 0) > 0 and (kelly_h or 0) > 0
+                bet_away = (ev_a or 0) > 0 and (kelly_a or 0) > 0
+
+                if bet_home and bet_away:
+                    # Ambos con EV > 0: apostar solo al de mayor EV
+                    if ev_h >= ev_a:
+                        bet_away = False
+                    else:
+                        bet_home = False
+
+                if bet_home:
+                    units = kelly_h
                     n_bets += 1
                     if winner == "HOME":
-                        # Ganamos: calcular pago según odds americanos
-                        payout = _calc_payout(odds_h, units)
-                        pnl += payout
+                        pnl += _calc_payout(odds_h, units)
                         n_wins += 1
                     else:
                         pnl -= units
 
-                if ev_a is not None and ev_a > 0 and kelly_a is not None and kelly_a > 0:
+                if bet_away:
                     units = kelly_a
                     n_bets += 1
                     if winner == "AWAY":
-                        payout = _calc_payout(odds_a, units)
-                        pnl += payout
+                        pnl += _calc_payout(odds_a, units)
                         n_wins += 1
                     else:
                         pnl -= units

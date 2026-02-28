@@ -601,11 +601,27 @@ def main():
 
     if snapshot_audit:
         violations = sum(1 for game_d, snap_d in snapshot_audit if snap_d >= game_d)
-        logger.info(
-            "Snapshot audit: %d juegos | violaciones T-1=%d",
-            len(snapshot_audit),
-            violations,
-        )
+        if violations > 0:
+            # Log detalles de las violaciones para debugging
+            bad_games = [(g, s) for g, s in snapshot_audit if s >= g]
+            for game_d, snap_d in bad_games[:5]:
+                logger.warning("Snapshot leakage: game=%s snapshot=%s", game_d, snap_d)
+            logger.warning(
+                "Snapshot audit: %d/%d juegos con snapshot >= game_date (data leakage risk!)",
+                violations, len(snapshot_audit),
+            )
+            if violations > len(snapshot_audit) * 0.01:  # >1% violaciones
+                logger.error(
+                    "Too many snapshot violations (%d/%d = %.1f%%). "
+                    "Check team table dates for temporal leakage.",
+                    violations, len(snapshot_audit),
+                    violations / len(snapshot_audit) * 100,
+                )
+        else:
+            logger.info(
+                "Snapshot audit: %d juegos | 0 violaciones T-1 ✓",
+                len(snapshot_audit),
+            )
     logger.info(
         "Filtrado dataset: sin snapshot T-1=%d | labels sospechosos= %d",
         skipped_no_snapshot,

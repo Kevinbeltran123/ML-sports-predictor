@@ -156,6 +156,7 @@ def calculate_robust_kelly_simple(
     epsilon: float = DEFAULT_EPSILON,
     alpha_cvar: float = DEFAULT_ALPHA_CVAR,
     max_bet_pct: float = DEFAULT_MAX_BET_PCT,
+    risk_multiplier: float = 1.0,
 ) -> float:
     """Version simplificada: retorna solo el % a apostar.
 
@@ -169,9 +170,14 @@ def calculate_robust_kelly_simple(
     La diferencia es que el robusto se ADAPTA al nivel de error del modelo.
     Con ε chico (modelo preciso), puede ser MAS agresivo que eighth-Kelly.
     Con ε grande, es automaticamente mas conservador.
+
+    Args:
+        risk_multiplier: factor de adaptive_risk_multiplier() basado en CVaR
+            reciente. Default 1.0 (sin ajuste). Rango: [0.25, 1.5].
     """
     result = calculate_robust_kelly(
         american_odds, model_prob, epsilon, alpha_cvar, max_bet_pct,
+        risk_multiplier=risk_multiplier,
     )
     return result["kelly_pct"]
 

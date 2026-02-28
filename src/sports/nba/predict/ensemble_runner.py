@@ -48,45 +48,97 @@ SIGMA_MIN = 0.02
 SIGMA_MAX = 0.20
 
 # --- Pesos del ensemble ---
-# Evaluacion Phase 7 en test set (809 juegos, 2025-10 a 2026-02), 179-feature golden set:
-#   XGB 65.0% (179-feat) + CatBoost 65.9% (179-feat):
-#   XGB 50/Cat 50: acc=65.27%, ECE=0.0365
-#   XGB 60/Cat 40: acc=66.38%, ECE=0.0313  <- MEJOR (supera meta 66.3%)
-#   XGB 70/Cat 30: acc=65.88%, ECE=0.0303
-#   60/40 da mejor accuracy Y mejor calibracion (ECE mas bajo)
-W_XGB_ML = 0.60
-W_CAT_ML = 0.40
+# Evaluacion v2 en test set (809 juegos, 2025-10 a 2026-02), 188 features:
+#   XGB 64.8% + CatBoost 65.6% + Diff_TS_PCT feature
+#   XGB 25/Cat 75: acc=65.6%, ECE=0.0355  <- MEJOR (grid search optimo)
+#   XGB 60/Cat 40: acc=64.8%, ECE=0.0437  (anterior)
+#   Optuna-tuned: 95/5 XGB/Cat — mejor calibracion (ECE 0.031)
+# Pesos se cargan desde metadata.json si disponible (ver _load_ensemble_weights)
+W_XGB_ML = 0.95
+W_CAT_ML = 0.05
 
 # --- CatBoost model loading ---
 CATBOOST_ACCURACY_PATTERN = re.compile(r"CatBoost_(\d+(?:\.\d+)?)%_")
+LIGHTGBM_ACCURACY_PATTERN = re.compile(r"LightGBM_(\d+(?:\.\d+)?)%_")
 
-# Modelo CatBoost cacheado (se carga una vez)
+# Modelos cacheados (se cargan una vez)
 _catboost_ml = None
+_catboost_calibrator = None
+_lightgbm_ml = None
+_lightgbm_calibrator = None
 
 
 def _select_catboost_path(kind="ML"):
     """Selecciona el mejor modelo CatBoost por accuracy + fecha de modificacion."""
     candidates = list(CATBOOST_MODELS_DIR.glob(f"*{kind}*.pkl"))
+    # Excluir archivos de calibracion
+    candidates = [c for c in candidates if "calibration" not in c.name]
     if not candidates:
         raise FileNotFoundError(f"No CatBoost {kind} model found in {CATBOOST_MODELS_DIR}")
 
     def score(path):
         match = CATBOOST_ACCURACY_PATTERN.search(path.name)
         accuracy = float(match.group(1)) if match else 0.0
-        # Accuracy es el criterio principal; mtime como desempate entre modelos de igual accuracy
         return (accuracy, path.stat().st_mtime)
 
     return max(candidates, key=score)
 
 
 def _load_catboost():
-    """Carga el modelo CatBoost ML (lazy, una sola vez)."""
-    global _catboost_ml
+    """Carga el modelo CatBoost ML + calibrator opcional (lazy, una sola vez)."""
+    global _catboost_ml, _catboost_calibrator
     if _catboost_ml is None:
         path = _select_catboost_path("ML")
         _catboost_ml = joblib.load(path)
         logger.info("CatBoost ML loaded: %s", path.name)
+
+        # Intentar cargar calibrator
+        cal_path = path.with_name(f"{path.stem}_calibration.pkl")
+        if cal_path.exists():
+            try:
+                _catboost_calibrator = joblib.load(cal_path)
+                logger.info("CatBoost calibrator loaded: %s", cal_path.name)
+            except Exception as e:
+                logger.warning("Error loading CatBoost calibrator: %s", e)
     return _catboost_ml
+
+
+def _load_lightgbm():
+    """Carga el modelo LightGBM ML + calibrator opcional (lazy, una sola vez).
+
+    Retorna None si no existe ningun modelo LightGBM (opcional en el ensemble).
+    """
+    global _lightgbm_ml, _lightgbm_calibrator
+    if _lightgbm_ml is None:
+        candidates = list(NBA_ML_MODELS_DIR.glob("LightGBM_*ML*.txt"))
+        if not candidates:
+            _lightgbm_ml = False
+            logger.debug("No LightGBM model found — 2-model ensemble")
+            return None
+
+        def score(path):
+            match = LIGHTGBM_ACCURACY_PATTERN.search(path.name)
+            accuracy = float(match.group(1)) if match else 0.0
+            return (accuracy, path.stat().st_mtime)
+
+        path = max(candidates, key=score)
+        try:
+            import lightgbm as _lgb
+            _lightgbm_ml = _lgb.Booster(model_file=str(path))
+            logger.info("LightGBM ML loaded: %s", path.name)
+
+            cal_path = path.with_name(f"{path.stem}_calibration.pkl")
+            if cal_path.exists():
+                try:
+                    _lightgbm_calibrator = joblib.load(cal_path)
+                    logger.info("LightGBM calibrator loaded: %s", cal_path.name)
+                except Exception as e:
+                    logger.warning("Error loading LightGBM calibrator: %s", e)
+        except Exception as e:
+            logger.warning("Error loading LightGBM: %s", e)
+            _lightgbm_ml = False
+
+    return _lightgbm_ml if _lightgbm_ml is not False else None
 
 
 def _load_ensemble_conformal(sportsbook=None):
@@ -126,11 +178,13 @@ def _load_ensemble_conformal(sportsbook=None):
 
 
 def _load_variance_model():
-    """Carga el modelo de varianza per-game (lazy, una sola vez).
+    """Carga las estadísticas de varianza del ensemble (lazy, una sola vez).
 
-    El modelo predice sigma(features) para cada partido:
-      sigma bajo → juego predecible → Kelly agresivo
-      sigma alto → juego incierto → Kelly conservador
+    ensemble_variance.json contiene mean_sigma y sigma_percentiles calculados
+    durante el training como |P_xgb - P_cat| (disagreement entre modelos).
+    Se usa para mapear disagreement per-game → epsilon para DRO-Kelly:
+      disagreement bajo → sigma bajo → Kelly agresivo
+      disagreement alto → sigma alto → Kelly conservador
 
     Si no existe ensemble_variance.json, retorna None (sigma es opcional).
     """
@@ -139,12 +193,13 @@ def _load_variance_model():
         variance_path = NBA_ML_MODELS_DIR / "ensemble_variance.json"
         if variance_path.exists():
             try:
-                booster = xgb.Booster()
-                booster.load_model(str(variance_path))
-                _variance_model = booster
-                logger.info("Variance model loaded: %s", variance_path.name)
+                import json
+                with open(variance_path) as f:
+                    _variance_model = json.load(f)
+                logger.info("Variance stats loaded: mean_sigma=%.4f",
+                            _variance_model["mean_sigma"])
             except Exception as e:
-                logger.warning("Error loading variance model: %s", e)
+                logger.warning("Error loading variance stats: %s", e)
                 _variance_model = False
         else:
             logger.debug("No ensemble_variance.json found — adaptive Kelly disabled")
@@ -152,39 +207,75 @@ def _load_variance_model():
     return _variance_model if _variance_model is not False else None
 
 
-def _predict_sigmas(variance_model, data, ml_probs, xgb_ml_probs, cat_ml_probs):
-    """Predice sigma per-game usando el modelo de varianza.
+def _predict_sigmas(variance_stats, data, ml_probs, xgb_ml_probs, cat_ml_probs):
+    """Estima sigma per-game desde el disagreement XGB↔CatBoost.
 
-    Features: datos base + 2 meta-features (margin, disagreement).
+    Usa las estadísticas de varianza del training (percentiles de |P_xgb - P_cat|)
+    para mapear el disagreement actual a un epsilon calibrado:
+      - disagreement < p25 → sigma bajo (modelo confiado, Kelly agresivo)
+      - disagreement > p75 → sigma alto (modelos discrepan, Kelly conservador)
+
+    El mapeo lineal interpola entre SIGMA_MIN y SIGMA_MAX usando el rango
+    de percentiles observado en training como referencia.
+
     Output: sigmas clipeados a [SIGMA_MIN, SIGMA_MAX].
     """
-    margin = np.max(ml_probs, axis=1) - 0.5
     disagreement = np.abs(xgb_ml_probs[:, 1] - cat_ml_probs[:, 1])
-    features_aug = np.column_stack([data, margin, disagreement])
-    sigmas = variance_model.predict(xgb.DMatrix(features_aug))
+
+    # Usar percentiles del training como referencia de escala
+    p25 = variance_stats["sigma_percentiles"]["25"]
+    p75 = variance_stats["sigma_percentiles"]["75"]
+    denom = p75 - p25 if p75 > p25 else 0.01
+
+    # Mapeo lineal: disagreement → [SIGMA_MIN, SIGMA_MAX]
+    # disagreement == p25 → SIGMA_MIN, disagreement == p75 → SIGMA_MAX
+    sigmas = SIGMA_MIN + (SIGMA_MAX - SIGMA_MIN) * (disagreement - p25) / denom
+
     return np.clip(sigmas, SIGMA_MIN, SIGMA_MAX)
 
 
 def _catboost_predict_proba(model, data):
-    """Predice probabilidades con CatBoost.
+    """Predice probabilidades con CatBoost, usando Platt si disponible.
 
-    CatBoost.predict_proba() retorna array (N, 2) con [P(away), P(home)],
-    mismo formato que XGBoost calibrado.
+    CatBoost.predict_proba() retorna array (N, 2) con [P(away), P(home)].
+    Si hay calibrator, aplica Platt scaling para mejorar calibracion.
     """
-    return model.predict_proba(data)
+    raw = model.predict_proba(data)
+    if _catboost_calibrator is not None:
+        return _catboost_calibrator.calibrate(raw[:, 1])
+    return raw
+
+
+def _load_ensemble_weights():
+    """Carga pesos del ensemble desde metadata.json, fallback a defaults."""
+    meta_path = NBA_ML_MODELS_DIR / "metadata.json"
+    if meta_path.exists():
+        try:
+            import json
+            with open(meta_path) as f:
+                meta = json.load(f)
+            weights = meta.get("weights", {})
+            if weights:
+                logger.info("Ensemble weights from metadata: %s", weights)
+                return weights
+        except Exception:
+            pass
+    return {"xgb": W_XGB_ML, "cat": W_CAT_ML}
 
 
 def _generate_all_predictions(data, todays_games_uo, frame_ml):
-    """Genera predicciones combinadas XGB+CatBoost para ML y XGB para O/U.
+    """Genera predicciones combinadas XGB+CatBoost(+LightGBM) para ML y XGB para O/U.
 
-    ML: weighted average XGB 60% + CatBoost 40%
-    O/U: XGBoost solo
+    ML: weighted average con pesos de metadata.json (o defaults 60/40).
+    Si LightGBM esta disponible y metadata incluye peso lgb, se incluye.
+    O/U: Totals model o XGBoost solo.
 
     Retorna (ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs).
     """
     # --- Cargar modelos ---
     XGBoost_Runner._load_models()
     cat_model = _load_catboost()
+    lgb_model = _load_lightgbm()
 
     # --- XGBoost ML ---
     xgb_ml_probs = XGBoost_Runner._predict_probs(
@@ -192,16 +283,36 @@ def _generate_all_predictions(data, todays_games_uo, frame_ml):
     )
 
     # --- CatBoost ML ---
-    # CatBoost usa los mismos datos crudos que XGBoost (sin normalizar)
     cat_ml_probs = _catboost_predict_proba(cat_model, data)
 
+    # --- LightGBM ML (opcional) ---
+    lgb_ml_probs = None
+    if lgb_model is not None:
+        p1 = lgb_model.predict(data)
+        if _lightgbm_calibrator is not None:
+            lgb_ml_probs = _lightgbm_calibrator.calibrate(p1)
+        else:
+            lgb_ml_probs = np.column_stack([1.0 - p1, p1])
+        logger.info("LightGBM predictions: mean_P(home)=%.3f", lgb_ml_probs[:, 1].mean())
+
     # --- Combinar ML: weighted average ---
-    ml_probs = W_XGB_ML * xgb_ml_probs + W_CAT_ML * cat_ml_probs
+    weights = _load_ensemble_weights()
+    w_xgb = weights.get("xgb", W_XGB_ML)
+    w_cat = weights.get("cat", W_CAT_ML)
+    w_lgb = weights.get("lgb", 0.0)
+
+    if lgb_ml_probs is not None and w_lgb > 0:
+        ml_probs = w_xgb * xgb_ml_probs + w_cat * cat_ml_probs + w_lgb * lgb_ml_probs
+        logger.info("3-model ensemble: XGB %.0f%% + Cat %.0f%% + LGB %.0f%%",
+                     w_xgb * 100, w_cat * 100, w_lgb * 100)
+    else:
+        # Renormalizar pesos si LightGBM no esta disponible
+        total = w_xgb + w_cat
+        ml_probs = (w_xgb / total) * xgb_ml_probs + (w_cat / total) * cat_ml_probs
 
     # --- O/U: Totals regression model (preferred) or XGBoost classifier (legacy) ---
     predicted_totals = predict_totals(data)
     if predicted_totals is not None:
-        # Use regression model: convert predicted total → P(over) via normal CDF
         ou_lines = np.asarray(todays_games_uo, dtype=float)
         p_over_arr = totals_p_over(predicted_totals, ou_lines)
         ou_probs = np.column_stack([1.0 - p_over_arr, p_over_arr])

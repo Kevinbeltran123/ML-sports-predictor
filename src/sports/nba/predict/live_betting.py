@@ -61,7 +61,9 @@ BETA = 0.45
 POLL_INTERVAL_SECONDS = 30
 
 # Tiempo maximo de polling en horas (evita loop infinito si algo falla)
-MAX_POLL_HOURS = 4
+# 5 horas para cubrir OT. Override con env var LIVE_BETTING_TIMEOUT_HOURS
+import os
+MAX_POLL_HOURS = int(os.environ.get("LIVE_BETTING_TIMEOUT_HOURS", 5))
 
 # --- Cache de modelos logisticos in-game (cargados una sola vez) ---
 _model_cache: dict[int, object] = {}        # period -> LogisticRegression
@@ -240,25 +242,47 @@ def multi_signal_adjustment(
 
 
 def _match_game_to_prediction(game: dict, pregame_predictions: list[dict]) -> dict | None:
-    """Encuentra la prediccion pre-partido que corresponde a un juego live."""
+    """Encuentra la prediccion pre-partido que corresponde a un juego live.
+
+    Estrategia de matching (en orden de prioridad):
+    1. Tricode/abbreviation match (mas robusto)
+    2. Substring match: nombre live contenido en nombre prediccion
+    3. City match: ciudad live contenida en nombre prediccion
+    """
+    live_home_tricode = game.get("home_tricode", "").upper()
+    live_away_tricode = game.get("away_tricode", "").upper()
     live_home_name = game.get("home_team", "").lower()
     live_away_name = game.get("away_team", "").lower()
     live_home_city = game.get("home_team_city", "").lower()
     live_away_city = game.get("away_team_city", "").lower()
 
-    for pred in pregame_predictions:
-        pred_home = pred["home_team"].lower()
-        pred_away = pred["away_team"].lower()
+    # Build abbreviation lookup from canonical names
+    from src.core.betting.bet_tracker import NBA_API_ABBREV
 
+    for pred in pregame_predictions:
+        pred_home = pred["home_team"]
+        pred_away = pred["away_team"]
+        pred_home_lower = pred_home.lower()
+        pred_away_lower = pred_away.lower()
+
+        # 1. Tricode match (strongest signal)
+        if live_home_tricode and live_away_tricode:
+            pred_home_tri = NBA_API_ABBREV.get(pred_home, "")
+            pred_away_tri = NBA_API_ABBREV.get(pred_away, "")
+            if (live_home_tricode == pred_home_tri and
+                    live_away_tricode == pred_away_tri):
+                return pred
+
+        # 2. Substring/endswith match
         home_match = (
-            live_home_name in pred_home or
-            pred_home.endswith(live_home_name) or
-            live_home_city in pred_home
+            live_home_name in pred_home_lower or
+            pred_home_lower.endswith(live_home_name) or
+            live_home_city in pred_home_lower
         )
         away_match = (
-            live_away_name in pred_away or
-            pred_away.endswith(live_away_name) or
-            live_away_city in pred_away
+            live_away_name in pred_away_lower or
+            pred_away_lower.endswith(live_away_name) or
+            live_away_city in pred_away_lower
         )
 
         if home_match and away_match:
@@ -445,7 +469,11 @@ def run_live_session(pregame_predictions: list[dict]):
                 if game_id in pbp_trackers and status == 2:
                     actions = get_live_play_by_play(game_id)
                     if actions:
+                        n_before = len(pbp_trackers[game_id]._plays) if hasattr(pbp_trackers[game_id], '_plays') else 0
                         pbp_trackers[game_id].update(actions)
+                        n_after = len(pbp_trackers[game_id]._plays) if hasattr(pbp_trackers[game_id], '_plays') else 0
+                        if n_after == n_before and n_before > 0:
+                            logger.debug("PBP data unchanged for %s (stale feed?)", game_id)
 
                 prev_period = last_period.get(game_id, 0)
 
