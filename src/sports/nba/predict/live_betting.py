@@ -53,17 +53,27 @@ from src.sports.nba.features.live_pbp_tracker import LivePBPTracker
 
 logger = logging.getLogger(__name__)
 
-# Factor de calibracion Bayesiana (Stern 1994, NBA-especifico)
-# El valor exacto importa menos que la idea: mas senal = mas peso
-BETA = 0.45
+# Factor de calibracion Bayesiana per-quarter (Stern 1994, NBA-especifico)
+# Mas quarter jugado = score mas predictivo = BETA mas alto
+BETA_BY_QUARTER = {1: 0.35, 2: 0.45, 3: 0.60, 4: 0.75}
+BETA = 0.45  # default fallback
 
-# Cuantos segundos esperar entre polls
+# Polling: 30s normal, 10s cuando algun juego tiene < 2min restantes en el Q
 POLL_INTERVAL_SECONDS = 30
+POLL_FAST_SECONDS = 10
+FAST_POLL_THRESHOLD = 120  # segundos restantes para activar fast polling
 
 # Tiempo maximo de polling en horas (evita loop infinito si algo falla)
 # 5 horas para cubrir OT. Override con env var LIVE_BETTING_TIMEOUT_HOURS
 import os
 MAX_POLL_HOURS = int(os.environ.get("LIVE_BETTING_TIMEOUT_HOURS", 5))
+
+def _parse_clock_seconds(clock_str: str) -> float:
+    """Parse NBA clock 'PT05M30.00S' → 330.0 seconds. Returns -1 if unparseable."""
+    import re
+    m = re.match(r"PT(\d+)M([\d.]+)S", clock_str)
+    return int(m.group(1)) * 60.0 + float(m.group(2)) if m else -1.0
+
 
 # --- Cache de modelos logisticos in-game (cargados una sola vez) ---
 _model_cache: dict[int, object] = {}        # period -> LogisticRegression
@@ -74,47 +84,43 @@ def bayesian_q1_adjustment(
     p_pregame: float,
     score_diff: int,
     total_possessions: float,
+    period: int = 1,
 ) -> tuple[float, str]:
-    """Ajusta la probabilidad de victoria del local usando el score de Q1.
+    """Ajusta la probabilidad de victoria del local usando el score del quarter.
 
     Formula:
-        logit_adj = logit(P_pregame) + B * (score_diff / sqrt(possessions))
+        logit_adj = logit(P_pregame) + B(Q) * (score_diff / sqrt(possessions))
         P_adjusted = sigmoid(logit_adj)
+
+    BETA es adaptativo por quarter: Q1=0.35, Q2=0.45, Q3=0.60, Q4=0.75.
+    En quarters mas avanzados, el score es mas predictivo del resultado final.
 
     Args:
         p_pregame:        probabilidad pre-partido del equipo local (0.0 a 1.0)
-        score_diff:       puntos_local - puntos_visitante al final de Q1
-                          (positivo = local gana Q1, negativo = visitante gana Q1)
-        total_possessions: posesiones estimadas del partido hasta el final de Q1
+        score_diff:       puntos_local - puntos_visitante
+        total_possessions: posesiones estimadas del partido hasta el momento
+        period:           quarter actual (1-4, default 1)
 
     Returns:
         (p_adjusted, explanation_string)
-
-    Ejemplos:
-        bayesian_q1_adjustment(0.68, 0, 50) -> (~0.680, "sin cambio")
-        bayesian_q1_adjustment(0.50, 8, 25) -> (~0.660, "local +8 con 25 poss")
-        bayesian_q1_adjustment(0.68, 8, 50) -> (~0.736)
     """
-    # Caso extremo: probabilidad ya en los bordes (0 o 1)
-    p_clamped = max(0.001, min(0.999, p_pregame))
+    beta = BETA_BY_QUARTER.get(period, BETA)
 
-    # Paso 1: Convertir a log-odds (espacio lineal donde podemos sumar)
+    p_clamped = max(0.001, min(0.999, p_pregame))
     logit_pre = math.log(p_clamped / (1.0 - p_clamped))
 
-    # Paso 2: Normalizar la senal del score por sqrt(posesiones)
     poss = max(1.0, total_possessions)
     normalized_signal = score_diff / math.sqrt(poss)
 
-    # Paso 3: Actualizar log-odds con la senal ponderada
-    delta_logit = BETA * normalized_signal
+    delta_logit = beta * normalized_signal
     logit_adj = logit_pre + delta_logit
 
-    # Paso 4: Convertir de vuelta a probabilidad con sigmoid
     p_adjusted = 1.0 / (1.0 + math.exp(-logit_adj))
 
     explanation = (
         f"score_diff={score_diff:+d}, poss~{poss:.0f}, "
-        f"senal_norm={normalized_signal:+.2f}, delta_logit={delta_logit:+.3f}"
+        f"B={beta:.2f}(Q{period}), senal={normalized_signal:+.2f}, "
+        f"delta={delta_logit:+.3f}"
     )
 
     return p_adjusted, explanation
@@ -236,9 +242,9 @@ def multi_signal_adjustment(
         away_poss = box_away.get("possessions", box_away.get("POSS", 25))
         total_poss = (float(home_poss) + float(away_poss)) / 2.0
 
-        p_adj, expl = bayesian_q1_adjustment(p_pregame, score_diff, total_poss)
+        p_adj, expl = bayesian_q1_adjustment(p_pregame, score_diff, total_poss, period=period)
         delta = p_adj - p_pregame
-        return p_adj, delta, f"[simple B=0.45] {expl}", 0
+        return p_adj, delta, f"[simple] {expl}", 0
 
 
 def _match_game_to_prediction(game: dict, pregame_predictions: list[dict]) -> dict | None:
@@ -320,7 +326,7 @@ def _print_period_update(
         )
     else:
         total_poss = 25.0 * period
-        p_adj, expl = bayesian_q1_adjustment(p_pre, score_diff, total_poss)
+        p_adj, expl = bayesian_q1_adjustment(p_pre, score_diff, total_poss, period=period)
         delta_from_pre = p_adj - p_pre
         expl = f"[sin box score] {expl}"
         conf_set = 0
@@ -366,12 +372,17 @@ def _print_period_update(
             print(f"  HINT: Si el mercado aun da {home.split()[-1]} > {p_adj:.0%} -> edge UNDER {home.split()[-1]}")
 
     print(f"  (detalle: {expl})")
+    print(f"  ({Fore.CYAN}generado {datetime.now().strftime('%H:%M:%S')} — revisar lineas live{Style.RESET_ALL})")
     print(f"{'=' * 65}")
 
     # --- Persist to CSV tracker ---
     try:
         from src.core.betting.live_tracker import log_adjustment
         method = "logistic" if "[logistic" in expl else "simple"
+        # Pick best-side odds for tracking
+        pick_home = p_adj >= 0.5
+        ml_odds = pred.get("ml_home_odds") if pick_home else pred.get("ml_away_odds")
+        kelly = pred.get("kelly_home") if pick_home else pred.get("kelly_away")
         log_adjustment(
             home_team=home,
             away_team=away,
@@ -382,6 +393,8 @@ def _print_period_update(
             p_adjusted=p_adj,
             conf_set_size=conf_set,
             method=method,
+            ml_odds=ml_odds,
+            kelly_pct=kelly,
         )
     except Exception as e:
         logger.debug("Live tracker write failed: %s", e)
@@ -414,6 +427,7 @@ def run_live_session(pregame_predictions: list[dict]):
     last_period = {}
     processed_periods = {}
     last_p_adjusted = {}
+    p_history = {}  # game_id -> {Q1: p_adj, Q2: p_adj, ...}
     pbp_trackers = {}  # game_id -> LivePBPTracker
 
     start_time = time.time()
@@ -476,11 +490,17 @@ def run_live_session(pregame_predictions: list[dict]):
                             logger.debug("PBP data unchanged for %s (stale feed?)", game_id)
 
                 prev_period = last_period.get(game_id, 0)
+                clock_secs = _parse_clock_seconds(game.get("clock", ""))
 
                 for check_period in [1, 2, 3]:
-                    if (check_period not in processed_periods[game_id] and
-                            period > check_period and
-                            status in (2, 3)):
+                    if check_period in processed_periods[game_id]:
+                        continue
+                    # Trigger: period ya avanzó O clock=0:00 en el periodo actual
+                    quarter_done = (
+                        period > check_period or
+                        (period == check_period and clock_secs == 0.0)
+                    )
+                    if quarter_done and status in (2, 3):
 
                         box = get_live_box_score(game_id) if status == 2 else None
 
@@ -499,6 +519,8 @@ def run_live_session(pregame_predictions: list[dict]):
                         )
                         processed_periods[game_id].add(check_period)
                         last_p_adjusted[game_id] = p_adj
+                        hist_key = pred["home_team"]
+                        p_history.setdefault(hist_key, {})[check_period] = p_adj
 
                 last_period[game_id] = period
 
@@ -528,10 +550,16 @@ def run_live_session(pregame_predictions: list[dict]):
                 print(f"  [poll #{poll_count}] Sin juegos monitoreados aun (esperando inicio)...")
 
             if all_final and monitored and len(monitored) == len(pregame_predictions):
-                _print_session_summary(pregame_predictions, last_p_adjusted, processed_periods)
+                _print_session_summary(pregame_predictions, last_p_adjusted, processed_periods, p_history)
                 break
 
-            time.sleep(POLL_INTERVAL_SECONDS)
+            # Fast polling cuando algun juego está cerca de terminar el Q
+            any_close = any(
+                0 < _parse_clock_seconds(g.get("clock", "")) <= FAST_POLL_THRESHOLD
+                for g in monitored
+            ) if monitored else False
+            sleep_time = POLL_FAST_SECONDS if any_close else POLL_INTERVAL_SECONDS
+            time.sleep(sleep_time)
 
     except KeyboardInterrupt:
         print(f"\n\n  Live betting interrumpido por el usuario.")
@@ -543,16 +571,40 @@ def _print_session_summary(
     predictions: list[dict],
     last_p: dict[str, float],
     processed: dict[str, set],
+    p_history: dict[str, dict[int, float]] | None = None,
 ):
     """Imprime resumen final de la sesion live con evolucion de probabilidades."""
+    p_history = p_history or {}
+
     print(f"\n{'=' * 65}")
     print(f"  RESUMEN DE SESION LIVE -- {datetime.now().strftime('%H:%M:%S')}")
-    print(f"{'-' * 65}")
+    print(f"{'=' * 65}")
+
+    # Header
+    print(f"  {'Equipo':<14} {'Pre':>7} {'Q1':>7} {'Q2':>7} {'Q3':>7} {'Final':>7}")
+    print(f"  {'-'*14} {'-'*7} {'-'*7} {'-'*7} {'-'*7} {'-'*7}")
 
     for pred in predictions:
         home = pred["home_team"].split()[-1]
+        away = pred["away_team"].split()[-1]
         p_pre = pred["p_pregame"]
-        print(f"  {home}: Pre={p_pre:.1%}", end="")
+        hist = p_history.get(pred["home_team"], {})
+
+        q1 = hist.get(1)
+        q2 = hist.get(2)
+        q3 = hist.get(3)
+        final = q3 or q2 or q1 or p_pre  # last available
+
+        q1_s = f"{q1:.1%}" if q1 else "  -  "
+        q2_s = f"{q2:.1%}" if q2 else "  -  "
+        q3_s = f"{q3:.1%}" if q3 else "  -  "
+
+        a_q1 = f"{1-q1:.1%}" if q1 else "  -  "
+        a_q2 = f"{1-q2:.1%}" if q2 else "  -  "
+        a_q3 = f"{1-q3:.1%}" if q3 else "  -  "
+
+        print(f"  {home:<14} {p_pre:>6.1%} {q1_s:>7} {q2_s:>7} {q3_s:>7} {final:>6.1%}")
+        print(f"  {away:<14} {1-p_pre:>6.1%} {a_q1:>7} {a_q2:>7} {a_q3:>7} {1-final:>6.1%}")
         print()
 
     print(f"{'=' * 65}")

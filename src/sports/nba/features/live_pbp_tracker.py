@@ -68,8 +68,8 @@ class LivePBPTracker:
         plays = []
         for act in actions:
             period = act.get("period", 0)
-            if period < 1 or period > 4:
-                continue  # Ignorar overtimes (igual que en training)
+            if period < 1 or period > 6:
+                continue  # Permitir hasta 2OT; features OT acumulan sobre Q4
 
             # Parsear scores (vienen como strings)
             try:

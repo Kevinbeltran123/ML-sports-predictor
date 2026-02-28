@@ -12,7 +12,7 @@ Para cada periodo (Q1, Q2, Q3), el runner intenta modelos en orden:
   1. XGBoost Q{period} (si existe) — Nivel 2, accuracy mas alta
   2. Logistic Q{period} (si existe) — Nivel 1, mas simple pero calibrado
   3. Fallback simple (siempre disponible):
-     - ML:     bayesian_q1_adjustment() con B=0.45
+     - ML:     bayesian_q1_adjustment() con BETA adaptivo por quarter
      - Spread: proyeccion lineal de margen vs spread
      - Total:  proyeccion lineal de scoring pace vs linea
 
@@ -443,7 +443,7 @@ def predict_ingame(
     away_poss = float(away_stats.get("POSS", 25))
     total_poss = (home_poss + away_poss) / 2.0
 
-    p_adj, expl = bayesian_q1_adjustment(p_pregame, score_diff, total_poss)
+    p_adj, expl = bayesian_q1_adjustment(p_pregame, score_diff, total_poss, period=period)
 
     return {
         "p_home": p_adj,
@@ -556,14 +556,15 @@ def predict_ingame_spread(
                 raw = booster.predict(dmat)
                 p_cover = float(raw[0, 1])
 
-            # Conformal
+            # Conformal — must pass 2D (1, 2) array
             set_size = 0
             if conformal is not None:
                 if calibrator is not None:
-                    prob_2d = calibrator.predict_proba(X)[0]
+                    prob_2d = calibrator.predict_proba(X)  # (1, 2)
                 else:
-                    prob_2d = raw[0]
-                set_size, _ = conformal.predict_confidence(prob_2d)
+                    prob_2d = raw[:1]  # keep 2D (1, 2) instead of raw[0]
+                set_sizes, _ = conformal.predict_confidence(prob_2d)
+                set_size = int(set_sizes[0])
 
             confidence = "HIGH" if set_size == 1 else "LOW" if set_size == 2 else "N/A"
 
@@ -700,14 +701,15 @@ def predict_ingame_total(
                 raw = booster.predict(dmat)
                 p_over = float(raw[0, 1])
 
-            # Conformal
+            # Conformal — must pass 2D (1, 2) array
             set_size = 0
             if conformal is not None:
                 if calibrator is not None:
-                    prob_2d = calibrator.predict_proba(X)[0]
+                    prob_2d = calibrator.predict_proba(X)  # (1, 2)
                 else:
-                    prob_2d = raw[0]
-                set_size, _ = conformal.predict_confidence(prob_2d)
+                    prob_2d = raw[:1]  # keep 2D (1, 2) instead of raw[0]
+                set_sizes, _ = conformal.predict_confidence(prob_2d)
+                set_size = int(set_sizes[0])
 
             confidence = "HIGH" if set_size == 1 else "LOW" if set_size == 2 else "N/A"
 

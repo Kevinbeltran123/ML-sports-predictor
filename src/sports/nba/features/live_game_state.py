@@ -192,6 +192,8 @@ def estimate_possessions(fgm: int, fga: int, tov: int, fta: int) -> float:
     Returns:
         Número estimado de posesiones (float)
     """
+    # Aproximacion sin ORB: full formula es FGA - FGM + ORB + TOV + 0.44*FTA
+    # ORB no disponible en live box scores; error ~5% vs formula completa
     return float(fga + tov + 0.44 * fta)
 
 

@@ -31,6 +31,8 @@ COLUMNS = [
     "delta",
     "conf_set_size",
     "method",
+    "ml_odds",
+    "kelly_pct",
     "result",
     "pnl",
 ]
@@ -56,6 +58,8 @@ def log_adjustment(
     p_adjusted: float,
     conf_set_size: int = 0,
     method: str = "simple",
+    ml_odds: int | None = None,
+    kelly_pct: float | None = None,
 ):
     """Append a live adjustment row to the CSV.
 
@@ -76,6 +80,8 @@ def log_adjustment(
         "delta": round(p_adjusted - p_pregame, 4),
         "conf_set_size": conf_set_size,
         "method": method,
+        "ml_odds": ml_odds or "",
+        "kelly_pct": round(kelly_pct, 2) if kelly_pct else "",
         "result": "",
         "pnl": "",
     }
@@ -137,7 +143,25 @@ def update_results(date: str = None):
                 continue
             key = (row["home_team"], row["away_team"])
             if key in result_map:
-                df.at[idx, "result"] = result_map[key]
+                winner = result_map[key]
+                df.at[idx, "result"] = winner
+
+                # Compute P&L if odds are available and conf_set_size == 1
+                odds = row.get("ml_odds")
+                if odds and str(odds).strip() and row.get("conf_set_size") == 1:
+                    try:
+                        odds = int(float(odds))
+                        pick_home = float(row["p_adjusted"]) >= 0.5
+                        home_won = winner == row["home_team"]
+                        bet_won = (pick_home and home_won) or (not pick_home and not home_won)
+                        if bet_won:
+                            pnl = 100 * (odds / 100) if odds > 0 else 100 * (100 / abs(odds))
+                        else:
+                            pnl = -100
+                        df.at[idx, "pnl"] = round(pnl, 2)
+                    except (ValueError, TypeError):
+                        pass
+
                 updated += 1
 
         if updated:
