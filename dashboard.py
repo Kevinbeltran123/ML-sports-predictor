@@ -368,24 +368,154 @@ with tab_h1:
                 )
 
             if h1_results:
+                from src.dashboard_helpers import compute_h1_safety, h1_safety_label
                 h1_df = h1_results_to_dataframe(h1_results, blocks)
 
-                # Highlight disagreements
-                def _highlight_disagree(val):
-                    return "background-color: #ff6b35; color: white; font-weight: bold" if val == "Yes" else ""
+                # Display columns (hide internal _checks, _sigma)
+                display_cols = [c for c in h1_df.columns if not c.startswith("_")]
 
-                styled_h1 = h1_df.style.map(_highlight_disagree, subset=["Disagree"]).format(
-                    {"FG Prob%": "{:.1f}", "H1 Prob%": "{:.1f}"}, na_rep="—"
+                # Color verdict
+                def _color_verdict(val):
+                    if val == "STRONG BET":
+                        return "background-color: #0d6e0d; color: white; font-weight: bold"
+                    elif val == "BET":
+                        return "background-color: #1a7a1a; color: white; font-weight: bold"
+                    elif val == "LEAN":
+                        return "background-color: #7a7a1a; color: white"
+                    else:
+                        return "background-color: #7a1a1a; color: white"
+
+                styled_h1 = h1_df[display_cols].style.map(_color_verdict, subset=["Verdict"]).format(
+                    {"FG Prob%": "{:.1f}", "H1 Prob%": "{:.1f}", "H1 XGB%": "{:.1f}", "H1 Cat%": "{:.1f}"},
+                    na_rep="—"
                 )
                 st.dataframe(styled_h1, use_container_width=True, hide_index=True)
 
-                # Summary
-                n_disagree = (h1_df["Disagree"] == "Yes").sum()
-                if n_disagree > 0:
-                    st.info(f"{n_disagree} game(s) where H1 and full-game picks disagree — potential hedging opportunities.")
+                # Safety checklist per game
+                st.subheader("Safety Checklist")
+                check_labels = {
+                    "conformal": "Conformal set_size = 1",
+                    "fg_agree": "FG + H1 mismo equipo",
+                    "h1_models_agree": "H1 XGB + Cat acuerdan",
+                    "prob_threshold": "H1 Prob > 60%",
+                    "low_sigma": "Sigma pregame < 0.10",
+                }
+                for idx, row in h1_df.iterrows():
+                    checks = row["_checks"]
+                    score_str = row["Safety"]
+                    verdict = row["Verdict"]
+                    game = row["Game"]
+                    pick = row["H1 Pick"]
 
-                n_h1_bet = (h1_df["H1 Tag"] == "BET").sum()
-                st.metric("H1 BET signals", n_h1_bet)
+                    with st.expander(f"{game} → 1H {pick} | {score_str} **{verdict}**"):
+                        for key, label in check_labels.items():
+                            passed = checks.get(key, False)
+                            icon = "✅" if passed else "❌"
+                            st.markdown(f"{icon} {label}")
+                        sigma_val = row["_sigma"]
+                        if sigma_val is not None:
+                            st.caption(f"σ = {sigma_val:.3f}")
+
+                # Summary metrics
+                col_s1, col_s2, col_s3 = st.columns(3)
+                n_strong = (h1_df["Verdict"] == "STRONG BET").sum()
+                n_bet = (h1_df["Verdict"] == "BET").sum()
+                n_lean = (h1_df["Verdict"] == "LEAN").sum()
+                col_s1.metric("STRONG BET", n_strong)
+                col_s2.metric("BET", n_bet)
+                col_s3.metric("LEAN", n_lean)
+
+                # ── Manual H1 Odds Input for EV/Kelly ──
+                st.subheader("H1 Odds Calculator")
+                st.caption("Ingresa las cuotas 1H (decimales) de tu sportsbook para calcular EV y Kelly.")
+
+                from src.core.betting import expected_value as EV_mod
+                from src.core.betting import kelly_criterion as kc_mod
+
+                def _decimal_to_american(dec_odds):
+                    """Convert decimal odds to american odds."""
+                    if dec_odds >= 2.0:
+                        return int(round((dec_odds - 1) * 100))
+                    else:
+                        return int(round(-100 / (dec_odds - 1)))
+
+                # Build pregame map for safety score lookup
+                _pregame_map = {}
+                for b in blocks:
+                    _pregame_map[(b["home"], b["away"])] = b
+
+                h1_calc_rows = []
+                for _, r in enumerate(h1_results):
+                    home = r["home_team"]
+                    away = r["away_team"]
+                    h1_pick_home = r["h1_prob_home"] >= 0.5
+                    pick_name = home.split()[-1] if h1_pick_home else away.split()[-1]
+                    pick_prob = r["h1_prob_home"] if h1_pick_home else r["h1_prob_away"]
+
+                    pb = _pregame_map.get((home, away), {})
+                    safety_score, _ = compute_h1_safety(r, pb)
+                    safety_label = h1_safety_label(safety_score)
+
+                    game_label = f"{away.split()[-1]} @ {home.split()[-1]}"
+                    col_game, col_odds, col_result = st.columns([2, 1, 2])
+
+                    with col_game:
+                        st.markdown(f"**{game_label}** → 1H {pick_name} ({pick_prob:.1%}) [{safety_score}/5 {safety_label}]")
+
+                    with col_odds:
+                        odds_input = st.number_input(
+                            f"1H ML {pick_name}",
+                            value=0.00, step=0.01, format="%.2f",
+                            key=f"h1_odds_{home}_{away}",
+                            help="Cuota decimal (ej: 1.80, 2.10). Deja en 0 para skip.",
+                        )
+
+                    with col_result:
+                        if odds_input > 1.0:
+                            american = _decimal_to_american(odds_input)
+                            ev = float(EV_mod.expected_value(pick_prob, american))
+                            kelly = float(kc_mod.calculate_eighth_kelly(american, pick_prob))
+
+                            ev_color = "🟢" if ev > 0 else "🔴"
+                            if ev <= 0:
+                                verdict = "PASS (EV-)"
+                            elif safety_score >= 4:
+                                verdict = "BET"
+                            elif safety_score >= 3:
+                                verdict = "LEAN"
+                            else:
+                                verdict = "SKIP"
+
+                            st.markdown(f"{ev_color} **EV: {ev:+.1f}%** | Kelly: {kelly:.2f}% | **{verdict}**")
+
+                            h1_calc_rows.append({
+                                "Game": game_label, "Pick": f"1H {pick_name}",
+                                "Prob%": round(pick_prob * 100, 1), "Odds": odds_input,
+                                "EV": round(ev, 1), "Kelly%": round(kelly, 2),
+                                "Safety": f"{safety_score}/5", "Verdict": verdict,
+                            })
+                        else:
+                            st.markdown("—")
+
+                if h1_calc_rows:
+                    st.divider()
+                    st.subheader("H1 Betting Summary")
+                    summary_df = pd.DataFrame(h1_calc_rows)
+                    def _color_summary_verdict(val):
+                        if val == "BET":
+                            return "background-color: #1a7a1a; color: white; font-weight: bold"
+                        elif val == "LEAN":
+                            return "background-color: #7a7a1a; color: white"
+                        elif "PASS" in str(val):
+                            return "background-color: #7a1a1a; color: white"
+                        elif val == "SKIP":
+                            return "background-color: #5a1a1a; color: white"
+                        return ""
+                    styled_summary = summary_df.style.map(_color_summary_verdict, subset=["Verdict"]).format(
+                        {"Prob%": "{:.1f}", "EV": "{:+.1f}", "Kelly%": "{:.2f}"}, na_rep="—"
+                    )
+                    st.dataframe(styled_summary, use_container_width=True, hide_index=True)
+
             else:
                 st.warning("H1 predictions returned no results.")
         else:

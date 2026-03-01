@@ -81,6 +81,56 @@ def get_global_feature_importance(booster, top_n=15):
     return pd.DataFrame(sorted_feats, columns=["Feature", "Gain"])
 
 
+H1_PROB_THRESHOLD = 0.60
+H1_SIGMA_THRESHOLD = 0.10
+
+
+def compute_h1_safety(h1_result, pregame_block):
+    """Compute H1 Safety Score (0-5) from 5 independent checks.
+
+    Checks:
+      1. Conformal set_size == 1 (model confident)
+      2. FG + H1 pick same team (full-game agreement)
+      3. H1 XGB + Cat agree (sub-model agreement)
+      4. H1 pick prob > 60% (minimum threshold)
+      5. Pregame sigma < 0.10 (low uncertainty game)
+
+    Returns:
+        (score, checks_dict) where checks_dict has bool per check.
+    """
+    r = h1_result
+    pb = pregame_block or {}
+
+    h1_pick_home = r["h1_prob_home"] >= 0.5
+    h1_pick = r["home_team"].split()[-1] if h1_pick_home else r["away_team"].split()[-1]
+    h1_prob = r["h1_prob_home"] if h1_pick_home else r["h1_prob_away"]
+
+    fg_pick = pb.get("pick", "—")
+    fg_pick_short = fg_pick.split()[-1] if fg_pick != "—" else "—"
+
+    checks = {
+        "conformal": r.get("h1_conformal_set_size", 0) == 1,
+        "fg_agree": fg_pick_short == h1_pick,
+        "h1_models_agree": r.get("h1_models_agree", False),
+        "prob_threshold": h1_prob >= H1_PROB_THRESHOLD,
+        "low_sigma": pb.get("sigma", 1.0) < H1_SIGMA_THRESHOLD,
+    }
+    score = sum(checks.values())
+    return score, checks
+
+
+def h1_safety_label(score):
+    """Map safety score to label."""
+    if score >= 5:
+        return "STRONG BET"
+    elif score >= 4:
+        return "BET"
+    elif score >= 3:
+        return "LEAN"
+    else:
+        return "SKIP"
+
+
 def h1_results_to_dataframe(h1_results, pregame_blocks):
     """Build H1 vs full-game comparison DataFrame."""
     if not h1_results:
@@ -104,9 +154,9 @@ def h1_results_to_dataframe(h1_results, pregame_blocks):
         fg_pick_short = fg_pick_full.split()[-1] if fg_pick_full != "—" else "—"
         fg_prob = pb.get("pick_prob", 0)
 
-        disagree = fg_pick_short != h1_pick
-        cs = r.get("h1_conformal_set_size", 0)
-        tag = "BET" if cs == 1 else ("SKIP" if cs == 2 else "—")
+        # Safety score
+        score, checks = compute_h1_safety(r, pb)
+        label = h1_safety_label(score)
 
         # EV from H1 odds
         h1_ev = "—"
@@ -123,8 +173,13 @@ def h1_results_to_dataframe(h1_results, pregame_blocks):
             "FG Prob%": round(fg_prob * 100, 1) if fg_prob else "—",
             "H1 Pick": h1_pick,
             "H1 Prob%": round(h1_prob * 100, 1),
+            "H1 XGB%": round(r.get("h1_xgb_home", 0) * 100, 1) if h1_pick_home else round((1 - r.get("h1_xgb_home", 1)) * 100, 1),
+            "H1 Cat%": round(r.get("h1_cat_home", 0) * 100, 1) if h1_pick_home else round((1 - r.get("h1_cat_home", 1)) * 100, 1),
             "H1 EV": h1_ev,
-            "H1 Tag": tag,
-            "Disagree": "Yes" if disagree else "",
+            "Safety": f"{score}/5",
+            "Verdict": label,
+            # Store checks for expander detail
+            "_checks": checks,
+            "_sigma": pb.get("sigma", None),
         })
     return pd.DataFrame(rows)

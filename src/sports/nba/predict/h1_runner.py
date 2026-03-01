@@ -178,11 +178,21 @@ def predict_h1(data, games, h1_odds_home=None, h1_odds_away=None, kelly_flag=Fal
         print(f"  [{tag}] {home.split()[-1]} vs {away.split()[-1]}: "
               f"1H {pick} {pick_prob:.1%}{odds_display}{ev_str}{kelly_str}")
 
+        # Individual model probs for agreement check
+        xgb_home = float(p_xgb[idx][1])
+        cat_home = float(p_cat[idx][1])
+        xgb_pick_home = xgb_home >= 0.5
+        cat_pick_home = cat_home >= 0.5
+        h1_models_agree = xgb_pick_home == cat_pick_home
+
         results.append({
             "home_team": home,
             "away_team": away,
             "h1_prob_home": p_home,
             "h1_prob_away": p_away,
+            "h1_xgb_home": xgb_home,
+            "h1_cat_home": cat_home,
+            "h1_models_agree": h1_models_agree,
             "h1_conformal_set_size": cs,
             "h1_ml_home_odds": h_odds,
             "h1_ml_away_odds": a_odds,
