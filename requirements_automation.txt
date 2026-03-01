@@ -1,0 +1,2 @@
+apscheduler>=3.10.0
+pytz>=2024.1

@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  nba-bot:
+    build: .
+    container_name: nba-wl-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # SQLite databases — read-write (BetsTracking, live_bets.csv)
+      - ./data:/app/data
+      # Models — read-only
+      - ./models:/app/models:ro
+    environment:
+      - PYTHONPATH=/app
+      - LOG_LEVEL=INFO
+      - DEFAULT_SPORTSBOOK=fanduel

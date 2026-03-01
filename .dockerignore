@@ -1,0 +1,16 @@
+# Heavy directories (mounted as volumes)
+data/
+models/
+
+# Git and caches
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Secrets (passed via env_file)
+.env
+
+# IDE and tools
+.claude/
+.vscode/

@@ -162,14 +162,16 @@ def predict_h1(data, games, h1_odds_home=None, h1_odds_away=None, kelly_flag=Fal
 
         ev_str = ""
         kelly_str = ""
+        ev_val = None
+        k_val = 0.0
         if h_odds and a_odds:
             odds = int(h_odds) if pick_home else int(a_odds)
-            ev = float(Expected_Value.expected_value(pick_prob, odds))
-            ev_str = f"  EV {ev:+.1f}%"
+            ev_val = float(Expected_Value.expected_value(pick_prob, odds))
+            ev_str = f"  EV {ev_val:+.1f}%"
 
-            if kelly_flag and ev > 0:
-                k = float(kc.calculate_eighth_kelly(odds, pick_prob))
-                kelly_str = f"  K={k:.2f}%"
+            if kelly_flag and ev_val > 0:
+                k_val = float(kc.calculate_eighth_kelly(odds, pick_prob))
+                kelly_str = f"  K={k_val:.2f}%"
 
         odds_display = ""
         if h_odds and a_odds:
@@ -185,6 +187,9 @@ def predict_h1(data, games, h1_odds_home=None, h1_odds_away=None, kelly_flag=Fal
         cat_pick_home = cat_home >= 0.5
         h1_models_agree = xgb_pick_home == cat_pick_home
 
+        # Plain tag for Telegram (without ANSI color codes)
+        tag_plain = "BET" if cs == 1 else ("SKIP" if cs == 2 else "---")
+
         results.append({
             "home_team": home,
             "away_team": away,
@@ -196,6 +201,10 @@ def predict_h1(data, games, h1_odds_home=None, h1_odds_away=None, kelly_flag=Fal
             "h1_conformal_set_size": cs,
             "h1_ml_home_odds": h_odds,
             "h1_ml_away_odds": a_odds,
+            "h1_ev": ev_val,
+            "h1_kelly": k_val,
+            "h1_pick": pick,
+            "h1_tag": tag_plain,
         })
 
     print(f"{'='*65}")

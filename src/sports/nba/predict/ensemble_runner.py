@@ -43,6 +43,9 @@ _ensemble_conformal = None
 # --- Modelo de varianza per-game para Kelly adaptativo ---
 _variance_model = None
 
+# --- Cache de blocks para Telegram formatter ---
+_last_blocks = []
+
 # Rango valido de epsilon (mismo que fit_variance_model.py)
 SIGMA_MIN = 0.02
 SIGMA_MAX = 0.20
@@ -824,6 +827,9 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
         predicted_totals,
     )
     _print_compact_output(blocks, kelly_criterion, conformal, sigmas is not None)
+
+    global _last_blocks
+    _last_blocks = blocks
 
     deinit()
     return _build_prediction_results(
