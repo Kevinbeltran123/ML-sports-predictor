@@ -573,11 +573,71 @@ def get_current_rotation(logs_db_path=None, season=None, cutoff_date=None):
     return dict(rotation)
 
 
-def fetch_injury_report(team_full_name):
-    """Obtiene reporte de lesiones de un equipo via Tank01 API (RapidAPI).
+# Cache de lesiones: {date_str -> {team_name -> {player -> designation}}}
+_injuries_cache: dict = {}
 
-    Llama al endpoint getNBATeamRoster que retorna el roster completo
-    con designaciones de lesion por jugador.
+
+def _fetch_all_injuries_today() -> dict:
+    """Fetcha TODAS las lesiones del dia en una sola llamada.
+
+    Usa nba-injury-reports.p.rapidapi.com — retorna lista plana
+    [{date, team, player, status, reason, reportTime}].
+
+    Cachea el resultado en memoria para evitar llamadas repetidas.
+    Una sola llamada sirve para todos los equipos del dia.
+
+    Returns:
+        dict[full_team_name -> {player_name -> designation}]
+        Retorna {} si no hay key o falla la API.
+    """
+    from datetime import datetime
+
+    api_key = os.environ.get("RAPIDAPI_KEY")
+    if not api_key:
+        return {}
+
+    date_str = datetime.today().strftime("%Y-%m-%d")
+
+    if date_str in _injuries_cache:
+        return _injuries_cache[date_str]
+
+    url = f"https://nba-injuries-reports.p.rapidapi.com/injuries/nba/{date_str}"
+    headers = {
+        "x-rapidapi-key": api_key,
+        "x-rapidapi-host": "nba-injuries-reports.p.rapidapi.com",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return {}
+
+    # Construir dict por equipo
+    by_team: dict = {}
+    records = data if isinstance(data, list) else data.get("body", [])
+    for record in records:
+        team = record.get("team", "")
+        player = record.get("player", "")
+        status = record.get("status", "")
+        if not team or not player or not status:
+            continue
+        team_norm = _normalize_team(team)
+        if team_norm not in by_team:
+            by_team[team_norm] = {}
+        if status not in ("", "Healthy", "Available"):
+            by_team[team_norm][player] = status
+
+    _injuries_cache[date_str] = by_team
+    return by_team
+
+
+def fetch_injury_report(team_full_name):
+    """Obtiene reporte de lesiones de un equipo via nba-injury-reports (RapidAPI).
+
+    Fetcha todas las lesiones del dia en una sola llamada (cacheada) y
+    filtra por equipo. Mucho mas eficiente que el endpoint por-equipo anterior.
 
     La API key se lee del env var RAPIDAPI_KEY.
     Si no hay key configurada, retorna {} (fallback a AVAIL=1.0).
@@ -590,45 +650,12 @@ def fetch_injury_report(team_full_name):
         ej: {'Jayson Tatum': 'Questionable', 'Jaylen Brown': 'Out'}
         Jugadores sanos no aparecen en el dict.
     """
-    api_key = os.environ.get("RAPIDAPI_KEY")
-    if not api_key:
+    all_injuries = _fetch_all_injuries_today()
+    if not all_injuries:
         return {}
 
-    team_abv = TANK01_TEAM_ABV.get(team_full_name)
-    if team_abv is None:
-        # Intentar con aliases
-        normalized = _normalize_team(team_full_name)
-        team_abv = TANK01_TEAM_ABV.get(normalized)
-        if team_abv is None:
-            return {}
-
-    url = "https://tank01-fantasy-stats.p.rapidapi.com/getNBATeamRoster"
-    headers = {
-        "x-rapidapi-key": api_key,
-        "x-rapidapi-host": "tank01-fantasy-stats.p.rapidapi.com",
-    }
-
-    try:
-        response = requests.get(url, headers=headers, params={"teamAbv": team_abv}, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
-        return {}
-
-    body = data.get("body", {})
-    roster = body.get("roster", []) if isinstance(body, dict) else []
-
-    injuries = {}
-    for player in roster:
-        injury_info = player.get("injury")
-        if injury_info and isinstance(injury_info, dict):
-            designation = injury_info.get("designation")
-            if designation and designation not in ("", "Healthy"):
-                name = player.get("longName", player.get("shortName", ""))
-                if name:
-                    injuries[name] = designation
-
-    return injuries
+    team_norm = _normalize_team(team_full_name)
+    return all_injuries.get(team_norm, {})
 
 
 def estimate_availability(rotation, team_name, injury_report):
