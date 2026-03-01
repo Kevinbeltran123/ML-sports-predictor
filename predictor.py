@@ -602,20 +602,8 @@ def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team
     return predictions
 
 
-def main(args, odds_cache=None):
-    odds = None
-    if args.odds:
-        if odds_cache is None:
-            odds_cache = OddsCache(sportsbook=args.odds)
-        odds = odds_cache.get("basketball_nba")
-
-    games, odds = resolve_games(odds, args.odds)
-    if games is None:
-        return
-
-    stats_json = get_json_data(DATA_URL)
-    df = to_data_frame(stats_json)
-    schedule_df = load_schedule()
+def build_all_lookups(games):
+    """Build all feature lookups. Used by both predictor.py and dashboard.py."""
     today = datetime.today()
 
     game_logs = build_current_game_logs()
@@ -645,12 +633,48 @@ def main(args, odds_cache=None):
 
     ff_lookup = build_four_factors_history()
 
+    return {
+        "game_logs": game_logs,
+        "elo_ratings": elo_ratings,
+        "split_data": split_data,
+        "team_availability": team_availability,
+        "team_schedule": team_schedule,
+        "travel_schedule": travel_schedule,
+        "sos_lookup": sos_lookup,
+        "srs_lookup": srs_lookup,
+        "lineup_lookup": lineup_lookup,
+        "ref_assignments": ref_assignments,
+        "ref_history": ref_history,
+        "ff_lookup": ff_lookup,
+    }
+
+
+def main(args, odds_cache=None):
+    odds = None
+    if args.odds:
+        if odds_cache is None:
+            odds_cache = OddsCache(sportsbook=args.odds)
+        odds = odds_cache.get("basketball_nba")
+
+    games, odds = resolve_games(odds, args.odds)
+    if games is None:
+        return
+
+    stats_json = get_json_data(DATA_URL)
+    df = to_data_frame(stats_json)
+    schedule_df = load_schedule()
+    today = datetime.today()
+
+    lookups = build_all_lookups(games)
+
     data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds = create_todays_games_data(
-        games, df, odds, schedule_df, today, game_logs, elo_ratings, split_data, team_availability, team_schedule,
-        travel_schedule=travel_schedule, sos_lookup=sos_lookup,
-        srs_lookup=srs_lookup, lineup_lookup=lineup_lookup,
-        ref_assignments=ref_assignments, ref_history=ref_history,
-        ff_lookup=ff_lookup,
+        games, df, odds, schedule_df, today,
+        lookups["game_logs"], lookups["elo_ratings"], lookups["split_data"],
+        lookups["team_availability"], lookups["team_schedule"],
+        travel_schedule=lookups["travel_schedule"], sos_lookup=lookups["sos_lookup"],
+        srs_lookup=lookups["srs_lookup"], lineup_lookup=lookups["lineup_lookup"],
+        ref_assignments=lookups["ref_assignments"], ref_history=lookups["ref_history"],
+        ff_lookup=lookups["ff_lookup"],
     )
 
     predictions = run_models(

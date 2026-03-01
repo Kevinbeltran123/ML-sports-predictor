@@ -108,12 +108,12 @@ POLYMARKET_DEFAULT_BANKROLL = 50.0
 LINEUP_DB     = TRAINING_DIR / "LineupData.sqlite"
 REFEREE_DB    = TRAINING_DIR / "RefereeData.sqlite"
 ARCHETYPES_MODEL_PATH = MODELS_DIR / "archetypes"
-ESPN_LINES_DB = SCRAPERS_DIR / "ESPNLines.sqlite"
+ESPN_LINES_DB = TRAINING_DIR / "ESPNLines.sqlite"
 _bref_new    = SCRAPERS_DIR / "BRefData.sqlite"
 BREF_DB = (
     _bref_new
     if (_bref_new.exists() and _bref_new.stat().st_size > 1024)
-    else DATA_DIR / "BRefData.sqlite"
+    else TRAINING_DIR / "BRefData.sqlite"
 )
 
 # --- Archivo de configuracion ---
