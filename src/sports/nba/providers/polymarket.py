@@ -11,6 +11,7 @@ Patron: sigue OddsApiProvider pero adaptado a prediction markets.
 
 import json
 import logging
+import re
 import time
 from difflib import SequenceMatcher
 
@@ -172,17 +173,16 @@ class PolymarketProvider:
             return []
 
     def get_nba_markets(self) -> dict:
-        """Descubre mercados NBA activos en Polymarket.
+        """Descubre mercados NBA activos en Polymarket (ML + AH).
 
-        Usa Gamma API para buscar eventos NBA, luego extrae token IDs
-        y precios de las outcomes.
+        Cada evento de juego contiene sub-mercados: moneyline, spreads, O/U, props.
+        Iteramos todos y clasificamos ML vs AH.
 
         Returns:
-            dict keyed by "Home:Away" (nombres canonicos) con:
-              home_token_id, away_token_id, home_price, away_price,
-              liquidity, volume, condition_id, slug
+            dict con keys:
+              "Home:Away" -> ML market data
+              "Home:Away:AH:-3.5" -> AH market data (one per spread line)
         """
-        # Buscar eventos NBA en Gamma (tag_slug, no tag)
         params = {
             "tag_slug": "nba",
             "active": "true",
@@ -192,7 +192,6 @@ class PolymarketProvider:
         events = self._get(GAMMA_EVENTS_URL, params)
 
         if not events:
-            # Fallback: buscar con tag_slug alternativo
             params["tag_slug"] = "basketball"
             events = self._get(GAMMA_EVENTS_URL, params)
 
@@ -202,72 +201,107 @@ class PolymarketProvider:
 
         markets = {}
         for event in events:
-            market = self._parse_nba_event(event)
-            if market:
-                key = f"{market['home_team']}:{market['away_team']}"
-                markets[key] = market
+            parsed = self._parse_game_event(event)
+            if parsed:
+                markets.update(parsed)
 
-        logger.info("Polymarket: %d NBA markets found", len(markets))
+        n_ml = sum(1 for k in markets if ":AH:" not in k)
+        n_ah = sum(1 for k in markets if ":AH:" in k)
+        logger.info("Polymarket: %d ML + %d AH markets found", n_ml, n_ah)
         return markets
 
-    def _parse_nba_event(self, event: dict) -> dict | None:
-        """Parsea un evento de Gamma API en formato de mercado.
+    # Regex para spread markets: "Spread: TeamName (-3.5)"
+    _SPREAD_RE = re.compile(r'^Spread:\s+(.+?)\s+\(([+-]?\d+\.?\d*)\)$')
+    _H1_SPREAD_RE = re.compile(r'^1H\s+Spread:\s+(.+?)\s+\(([+-]?\d+\.?\d*)\)$')
 
-        Los eventos NBA en Polymarket tipicamente tienen:
-        - title: "Will the Lakers win against the Celtics?"
-        - markets: lista con outcome tokens (YES/NO para cada equipo)
+    def _parse_game_event(self, event: dict) -> dict | None:
+        """Parsea un evento de juego NBA en mercados ML + AH.
+
+        Un evento como "Nuggets vs. Grizzlies" contiene sub-mercados:
+        - ML: question = event title, outcomes = team names
+        - AH: question = "Spread: TeamName (-X.5)"
+        - O/U, props: ignorados por ahora
         """
         title = event.get("title", "")
         slug = event.get("slug", "")
 
-        # Extraer equipos del titulo
         teams = self._extract_teams_from_title(title)
         if not teams:
             return None
 
         home_team, away_team = teams
-
-        # Buscar markets dentro del evento
         event_markets = event.get("markets", [])
         if not event_markets:
             return None
 
-        # En NBA, tipicamente hay 1 market binario (equipo A gana vs equipo B gana)
-        mkt = event_markets[0]
+        result = {}
+        game_key = f"{home_team}:{away_team}"
 
-        # Outcome tokens — API returns JSON strings, need to parse
+        for mkt in event_markets:
+            question = mkt.get("question", "")
+            parsed = self._parse_market_data(mkt)
+            if not parsed:
+                continue
+
+            outcomes, prices, clob_token_ids, liquidity, volume = parsed
+
+            # Clasificar mercado por tipo
+            spread_match = self._SPREAD_RE.match(question)
+            h1_spread_match = self._H1_SPREAD_RE.match(question)
+
+            if spread_match:
+                # AH/Spread market
+                team_raw = spread_match.group(1)
+                spread_val = float(spread_match.group(2))
+                ah_market = self._build_ah_market(
+                    home_team, away_team, team_raw, spread_val,
+                    outcomes, prices, clob_token_ids, liquidity, volume,
+                    mkt, slug,
+                )
+                if ah_market:
+                    key = f"{game_key}:AH:{spread_val:+.1f}"
+                    result[key] = ah_market
+
+            elif h1_spread_match:
+                # 1H Spread — skip for now (future feature)
+                pass
+
+            elif not any(kw in question.lower() for kw in ("spread", "o/u", "over", "under", "assists", "points", "rebounds", "three")):
+                # Moneyline market: question matches event title or is generic "Team vs Team"
+                ml_market = self._build_ml_market(
+                    home_team, away_team,
+                    outcomes, prices, clob_token_ids, liquidity, volume,
+                    mkt, slug, question, title,
+                )
+                if ml_market and game_key not in result:
+                    result[game_key] = ml_market
+
+        return result if result else None
+
+    def _parse_market_data(self, mkt: dict):
+        """Extrae outcomes, prices, token IDs de un sub-mercado."""
         outcomes_raw = mkt.get("outcomes", [])
         prices_raw = mkt.get("outcomePrices", [])
 
-        # Parse JSON strings if needed (API returns '["Yes","No"]' as string)
         if isinstance(outcomes_raw, str):
             try:
                 outcomes_raw = json.loads(outcomes_raw)
             except (ValueError, TypeError):
-                outcomes_raw = []
+                return None
         if isinstance(prices_raw, str):
             try:
                 prices_raw = json.loads(prices_raw)
             except (ValueError, TypeError):
-                prices_raw = []
+                return None
 
-        outcomes = outcomes_raw
-        outcome_prices = prices_raw
-
-        if len(outcomes) < 2 or len(outcome_prices) < 2:
+        if len(outcomes_raw) < 2 or len(prices_raw) < 2:
             return None
 
         try:
-            prices = [float(p) for p in outcome_prices]
+            prices = [float(p) for p in prices_raw]
         except (ValueError, TypeError):
             return None
 
-        # Determinar cual outcome es home y cual away
-        home_idx, away_idx = self._match_outcomes_to_teams(
-            outcomes, home_team, away_team
-        )
-
-        # Extraer token IDs del CLOB (tambien viene como JSON string)
         clob_token_ids = mkt.get("clobTokenIds", [])
         if isinstance(clob_token_ids, str):
             try:
@@ -277,23 +311,86 @@ class PolymarketProvider:
         if len(clob_token_ids) < 2:
             clob_token_ids = [None, None]
 
-        condition_id = mkt.get("conditionId", "")
         liquidity = float(mkt.get("liquidityNum", 0) or 0)
         volume = float(mkt.get("volumeNum", 0) or 0)
+        return outcomes_raw, prices, clob_token_ids, liquidity, volume
 
+    def _build_ml_market(self, home_team, away_team, outcomes, prices,
+                         clob_token_ids, liquidity, volume, mkt, slug,
+                         question, title):
+        """Construye dict de mercado ML."""
+        home_idx, away_idx = self._match_outcomes_to_teams(outcomes, home_team, away_team)
         return {
             "home_team": home_team,
             "away_team": away_team,
+            "market_type": "ML",
             "home_token_id": clob_token_ids[home_idx] if clob_token_ids[home_idx] else None,
             "away_token_id": clob_token_ids[away_idx] if clob_token_ids[away_idx] else None,
             "home_price": prices[home_idx],
             "away_price": prices[away_idx],
             "liquidity": liquidity,
             "volume": volume,
-            "condition_id": condition_id,
+            "condition_id": mkt.get("conditionId", ""),
             "slug": slug,
-            "question": mkt.get("question", title),
+            "question": question or title,
         }
+
+    def _build_ah_market(self, home_team, away_team, team_raw, spread_val,
+                         outcomes, prices, clob_token_ids, liquidity, volume,
+                         mkt, slug):
+        """Construye dict de mercado AH/spread.
+
+        En Polymarket los spreads son: "Spread: Grizzlies (-3.5)"
+        - outcomes[0] = team con el spread (Grizzlies), price = P(cubre)
+        - outcomes[1] = otro team, price = P(no cubre)
+        """
+        cover_team = _normalize_team_name(team_raw)
+        if not cover_team:
+            return None
+
+        # Asignar desde perspectiva home
+        if cover_team == home_team:
+            home_spread = spread_val
+            home_price = prices[0]
+            away_price = prices[1]
+            home_token_id = clob_token_ids[0]
+            away_token_id = clob_token_ids[1]
+        elif cover_team == away_team:
+            home_spread = -spread_val
+            home_price = prices[1]
+            away_price = prices[0]
+            home_token_id = clob_token_ids[1]
+            away_token_id = clob_token_ids[0]
+        else:
+            return None
+
+        return {
+            "home_team": home_team,
+            "away_team": away_team,
+            "market_type": "AH",
+            "spread_line": home_spread,
+            "home_token_id": home_token_id if home_token_id else None,
+            "away_token_id": away_token_id if away_token_id else None,
+            "home_price": home_price,
+            "away_price": away_price,
+            "liquidity": liquidity,
+            "volume": volume,
+            "condition_id": mkt.get("conditionId", ""),
+            "slug": slug,
+            "question": mkt.get("question", ""),
+        }
+
+    # Kept for backward compatibility (used by _build_ml_market)
+    def _parse_nba_event(self, event: dict) -> dict | None:
+        """Legacy: parsea solo el primer mercado ML de un evento."""
+        result = self._parse_game_event(event)
+        if not result:
+            return None
+        # Return first ML market found
+        for key, mkt in result.items():
+            if ":AH:" not in key:
+                return mkt
+        return None
 
     def _extract_teams_from_title(self, title: str) -> tuple[str, str] | None:
         """Extrae nombres de equipos del titulo del evento.
@@ -426,48 +523,70 @@ class PolymarketProvider:
 
         Args:
             games: lista de (home_team, away_team) del pipeline
-            markets: dict de get_nba_markets()
+            markets: dict de get_nba_markets() con keys "H:A" (ML) y "H:A:AH:-3.5" (AH)
 
         Returns:
-            dict: game_key -> market_data (solo juegos matcheados)
+            dict con keys:
+              "Home:Away" -> ML market data
+              "Home:Away:AH:-3.5" -> AH market data (best AH per game)
         """
         matched = {}
         for home, away in games:
             game_key = f"{home}:{away}"
-
-            # Match directo
-            if game_key in markets:
-                matched[game_key] = markets[game_key]
-                continue
-
-            # Match inverso (PM pone equipos en orden diferente)
             inv_key = f"{away}:{home}"
-            if inv_key in markets:
-                # Swap prices para que home sea consistente
-                mkt = markets[inv_key].copy()
-                mkt["home_team"] = home
-                mkt["away_team"] = away
-                mkt["home_price"], mkt["away_price"] = mkt["away_price"], mkt["home_price"]
-                mkt["home_token_id"], mkt["away_token_id"] = mkt["away_token_id"], mkt["home_token_id"]
-                matched[game_key] = mkt
-                continue
 
-            # Fuzzy match por nombre parcial
+            # --- ML match ---
+            ml_mkt = self._find_market(game_key, inv_key, markets, "ML")
+            if ml_mkt:
+                matched[game_key] = ml_mkt
+
+            # --- AH matches: find all spread lines for this game ---
             for mkt_key, mkt_data in markets.items():
+                if ":AH:" not in mkt_key:
+                    continue
                 mkt_home = mkt_data["home_team"]
                 mkt_away = mkt_data["away_team"]
-                if (mkt_home == home and mkt_away == away) or \
-                   (mkt_home == away and mkt_away == home):
-                    if mkt_home == home:
-                        matched[game_key] = mkt_data
-                    else:
-                        swapped = mkt_data.copy()
-                        swapped["home_team"] = home
-                        swapped["away_team"] = away
-                        swapped["home_price"], swapped["away_price"] = swapped["away_price"], swapped["home_price"]
-                        swapped["home_token_id"], swapped["away_token_id"] = swapped["away_token_id"], swapped["home_token_id"]
-                        matched[game_key] = swapped
-                    break
+                is_direct = (mkt_home == home and mkt_away == away)
+                is_inverse = (mkt_home == away and mkt_away == home)
 
-        logger.info("Polymarket: %d/%d games matched", len(matched), len(games))
+                if is_direct:
+                    spread_line = mkt_data["spread_line"]
+                    matched[f"{game_key}:AH:{spread_line:+.1f}"] = mkt_data
+                elif is_inverse:
+                    swapped = self._swap_market(mkt_data, home, away)
+                    spread_line = swapped["spread_line"]
+                    matched[f"{game_key}:AH:{spread_line:+.1f}"] = swapped
+
+        n_ml = sum(1 for k in matched if ":AH:" not in k)
+        n_ah = sum(1 for k in matched if ":AH:" in k)
+        logger.info("Polymarket: matched %d ML + %d AH / %d games", n_ml, n_ah, len(games))
         return matched
+
+    def _find_market(self, game_key, inv_key, markets, mtype):
+        """Busca mercado ML por game_key directo o inverso."""
+        if game_key in markets and markets[game_key].get("market_type", "ML") == mtype:
+            return markets[game_key]
+        if inv_key in markets and markets[inv_key].get("market_type", "ML") == mtype:
+            home, away = game_key.split(":")
+            return self._swap_market(markets[inv_key], home, away)
+        # Fuzzy match
+        for mkt_key, mkt_data in markets.items():
+            if ":AH:" in mkt_key:
+                continue
+            if mkt_data["home_team"] == game_key.split(":")[0] and mkt_data["away_team"] == game_key.split(":")[1]:
+                return mkt_data
+            if mkt_data["home_team"] == inv_key.split(":")[0] and mkt_data["away_team"] == inv_key.split(":")[1]:
+                home, away = game_key.split(":")
+                return self._swap_market(mkt_data, home, away)
+        return None
+
+    def _swap_market(self, mkt, home, away):
+        """Swap home/away en un mercado para que matchee el game del pipeline."""
+        swapped = mkt.copy()
+        swapped["home_team"] = home
+        swapped["away_team"] = away
+        swapped["home_price"], swapped["away_price"] = swapped["away_price"], swapped["home_price"]
+        swapped["home_token_id"], swapped["away_token_id"] = swapped["away_token_id"], swapped["home_token_id"]
+        if "spread_line" in swapped:
+            swapped["spread_line"] = -swapped["spread_line"]
+        return swapped

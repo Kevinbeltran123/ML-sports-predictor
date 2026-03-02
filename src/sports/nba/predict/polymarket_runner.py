@@ -30,6 +30,7 @@ from src.core.betting.polymarket_risk import (
     MIN_LIQUIDITY_USDC,
 )
 from src.core.betting.polymarket_tracker import PolymarketTracker
+from src.core.betting.spread_math import p_cover
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class PolymarketSignal:
     pick_team: str            # equipo al que apostar
     pick_side: str            # "home" o "away"
     action: str               # BUY / SELL / HOLD / SKIP
-    model_prob: float         # P(pick_team gana) del ensemble
+    model_prob: float         # P(pick_team gana/cubre) del ensemble
     market_price: float       # precio del share en PM
     edge: float               # model_prob - market_price
     ev_per_100: float         # EV normalizado a $100
@@ -51,6 +52,8 @@ class PolymarketSignal:
     shares: int               # shares a comprar
     cost_usdc: float          # costo total
     liquidity: float          # liquidez del mercado
+    market_type: str = "ML"   # "ML" o "AH"
+    spread_line: float = 0.0  # linea de spread para AH
     sigma: float = 0.05       # epsilon del modelo
     token_id: str = None
     american_odds: int = 0    # equivalente americano del share price
@@ -66,12 +69,9 @@ def generate_polymarket_signals(
 ) -> list[PolymarketSignal]:
     """Genera senales de trading comparando ensemble vs Polymarket prices.
 
-    Args:
-        predictions: lista de dicts del ensemble_runner (prob_home, prob_away, etc.)
-        markets: dict de PolymarketProvider.match_markets_to_games()
-        bankroll: bankroll en USDC
-        sigma_default: epsilon default si no hay sigma per-game
-        dry_run: si True, lee posiciones dry-run para el risk check; si False, las reales
+    Genera ML + AH signals. Markets dict tiene keys:
+      "Home:Away" -> ML market
+      "Home:Away:AH:-3.5" -> AH market (one per spread line)
 
     Returns:
         lista de PolymarketSignal, rankeada por edge descendente
@@ -85,28 +85,37 @@ def generate_polymarket_signals(
 
     for pred in predictions:
         game_key = f"{pred['home_team']}:{pred['away_team']}"
-
-        if game_key not in markets:
-            continue
-
-        mkt = markets[game_key]
         sigma = pred.get("sigma", sigma_default)
 
-        # Evaluar home side
-        home_signal = _evaluate_side(
-            pred, mkt, "home", sigma, bankroll, risk_mgr, open_positions, game_date,
-        )
-        # Evaluar away side
-        away_signal = _evaluate_side(
-            pred, mkt, "away", sigma, bankroll, risk_mgr, open_positions, game_date,
-        )
+        # --- ML signal ---
+        if game_key in markets:
+            mkt = markets[game_key]
+            home_signal = _evaluate_side(
+                pred, mkt, "home", sigma, bankroll, risk_mgr, open_positions, game_date,
+            )
+            away_signal = _evaluate_side(
+                pred, mkt, "away", sigma, bankroll, risk_mgr, open_positions, game_date,
+            )
+            best = home_signal if home_signal.edge > away_signal.edge else away_signal
+            best.market_type = "ML"
+            signals.append(best)
 
-        # Elegir el lado con mayor edge
-        best = home_signal if home_signal.edge > away_signal.edge else away_signal
+        # --- AH signals: find best spread line for this game ---
+        ah_signals = []
+        for mkt_key, mkt_data in markets.items():
+            if not mkt_key.startswith(game_key + ":AH:"):
+                continue
+            ah_sig = _evaluate_ah_side(
+                pred, mkt_data, sigma, bankroll, risk_mgr, open_positions, game_date,
+            )
+            if ah_sig:
+                ah_signals.append(ah_sig)
 
-        signals.append(best)
+        if ah_signals:
+            # Pick best AH signal (highest edge)
+            best_ah = max(ah_signals, key=lambda s: s.edge)
+            signals.append(best_ah)
 
-    # Rankear por edge descendente
     signals.sort(key=lambda s: s.edge, reverse=True)
     return signals
 
@@ -183,6 +192,104 @@ def _evaluate_side(
         shares=shares,
         cost_usdc=cost,
         liquidity=liquidity,
+        market_type="ML",
+        sigma=sigma,
+        token_id=token_id,
+        american_odds=am_odds,
+        skip_reason=skip_reason,
+    )
+
+
+def _evaluate_ah_side(
+    pred: dict,
+    mkt: dict,
+    sigma: float,
+    bankroll: float,
+    risk_mgr: PolymarketRiskManager,
+    open_positions: list[dict],
+    game_date: str,
+) -> PolymarketSignal | None:
+    """Evalua un mercado AH/spread de Polymarket.
+
+    Usa p_cover() de spread_math para computar P(team cubre spread)
+    y compara contra el precio del share en PM.
+    """
+    home_team = pred["home_team"]
+    away_team = pred["away_team"]
+    game_key = f"{home_team}:{away_team}"
+    prob_home = pred["prob_home"]
+
+    spread_line = mkt.get("spread_line", 0.0)
+    home_price = mkt.get("home_price", 0.5)
+    away_price = mkt.get("away_price", 0.5)
+    liquidity = mkt.get("liquidity", 0)
+
+    # P(home cubre spread) usando spread_math
+    p_home_cover = p_cover(prob_home, spread_line)
+    p_away_cover = 1.0 - p_home_cover
+
+    # Evaluar ambos lados
+    home_edge = p_home_cover - home_price
+    away_edge = p_away_cover - away_price
+
+    if home_edge >= away_edge:
+        model_prob = p_home_cover
+        price = home_price
+        edge = home_edge
+        pick_team = home_team
+        pick_side = "home"
+        token_id = mkt.get("home_token_id")
+    else:
+        model_prob = p_away_cover
+        price = away_price
+        edge = away_edge
+        pick_team = away_team
+        pick_side = "away"
+        token_id = mkt.get("away_token_id")
+
+    ev_100 = polymarket_ev_per_100(model_prob, price)
+    kelly_result = polymarket_kelly(model_prob, price, epsilon=sigma)
+    kelly_pct = kelly_result["kelly_pct"]
+    shares = shares_from_kelly(kelly_pct, bankroll, price)
+    cost = cost_basis(shares, price)
+    am_odds = share_price_to_american_odds(price)
+
+    action = "SKIP"
+    skip_reason = ""
+    if kelly_pct <= 0:
+        skip_reason = "no robust edge (Kelly=0)"
+    elif shares <= 0:
+        skip_reason = "position too small"
+    else:
+        risk_check = risk_mgr.validate_new_position(
+            cost_usdc=cost,
+            liquidity=liquidity,
+            edge=edge,
+            open_positions=open_positions,
+            game_date=game_date,
+        )
+        if risk_check.allowed:
+            action = "BUY"
+        else:
+            skip_reason = risk_check.reason
+
+    return PolymarketSignal(
+        game_key=game_key,
+        home_team=home_team,
+        away_team=away_team,
+        pick_team=pick_team,
+        pick_side=pick_side,
+        action=action,
+        model_prob=model_prob,
+        market_price=price,
+        edge=edge,
+        ev_per_100=ev_100,
+        kelly_pct=kelly_pct,
+        shares=shares,
+        cost_usdc=cost,
+        liquidity=liquidity,
+        market_type="AH",
+        spread_line=spread_line,
         sigma=sigma,
         token_id=token_id,
         american_odds=am_odds,
@@ -228,6 +335,8 @@ def log_signals_to_tracker(
                 shares=sig.shares,
                 model_prob=sig.model_prob,
                 dry_run=dry_run,
+                market_type=sig.market_type,
+                spread_line=sig.spread_line,
             )
 
 
@@ -253,7 +362,6 @@ def print_polymarket_output(
     print(f"{'='*60}{Style.RESET_ALL}")
 
     for rank, sig in enumerate(signals, 1):
-        # Pick line
         prob_pct = sig.model_prob * 100
         loser = sig.away_team if sig.pick_side == "home" else sig.home_team
 
@@ -266,8 +374,14 @@ def print_polymarket_output(
         else:
             tag = f"{Fore.YELLOW}SKIP{Style.RESET_ALL}"
 
+        # Market type tag
+        if sig.market_type == "AH":
+            type_tag = f"{Fore.MAGENTA}[AH {sig.spread_line:+.1f}]{Style.RESET_ALL}"
+        else:
+            type_tag = f"{Fore.CYAN}[ML]{Style.RESET_ALL}"
+
         print(f"  {Fore.CYAN}#{rank}{Style.RESET_ALL}  "
-              f"{sig.pick_team} ({prob_pct:.1f}%) vs {loser}  [{tag}]")
+              f"{type_tag} {sig.pick_team} ({prob_pct:.1f}%) vs {loser}  [{tag}]")
 
         if sig.action == "BUY":
             edge_color = Fore.GREEN if sig.edge > 0.05 else Fore.YELLOW

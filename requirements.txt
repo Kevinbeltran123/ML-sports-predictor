@@ -10,3 +10,5 @@ python-dotenv>=1.0.0
 joblib
 toml
 colorama
+MLB-StatsAPI>=1.7.2
+pybaseball>=2.2.5

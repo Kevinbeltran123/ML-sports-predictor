@@ -36,7 +36,7 @@ class PolymarketTracker:
         self._init_db()
 
     def _init_db(self):
-        """Crea tablas si no existen."""
+        """Crea tablas si no existen. Migra schema si falta market_type."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as con:
             con.execute("""
@@ -57,11 +57,19 @@ class PolymarketTracker:
                     exit_reason TEXT,
                     status TEXT NOT NULL DEFAULT 'OPEN',   -- OPEN / CLOSED
                     dry_run INTEGER NOT NULL DEFAULT 1,    -- 1=dry run, 0=real
+                    market_type TEXT NOT NULL DEFAULT 'ML', -- ML / AH
+                    spread_line REAL DEFAULT 0.0,           -- spread line for AH
                     created_at TEXT NOT NULL,
                     closed_at TEXT,
-                    UNIQUE(game_date, game_key, team, dry_run)
+                    UNIQUE(game_date, game_key, team, market_type, dry_run)
                 )
             """)
+            # Migrate existing table if market_type column is missing
+            columns = [row[1] for row in con.execute("PRAGMA table_info(positions)").fetchall()]
+            if "market_type" not in columns:
+                logger.info("Migrating positions table: adding market_type + spread_line columns")
+                con.execute("ALTER TABLE positions ADD COLUMN market_type TEXT NOT NULL DEFAULT 'ML'")
+                con.execute("ALTER TABLE positions ADD COLUMN spread_line REAL DEFAULT 0.0")
             con.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,8 +152,10 @@ class PolymarketTracker:
         shares: int,
         model_prob: float = None,
         dry_run: bool = True,
+        market_type: str = "ML",
+        spread_line: float = 0.0,
     ):
-        """Abre una nueva posicion solo si no existe ya una abierta para ese juego/equipo.
+        """Abre una nueva posicion solo si no existe ya una abierta para ese juego/equipo/tipo.
 
         Usa INSERT OR IGNORE para evitar sobreescribir posiciones abiertas si el predictor
         se ejecuta mas de una vez el mismo dia (entry_price y cost_basis se preservan).
@@ -158,12 +168,12 @@ class PolymarketTracker:
                 INSERT OR IGNORE INTO positions (
                     game_date, game_key, team, token_id,
                     entry_price, shares, cost_basis, model_prob,
-                    current_price, status, dry_run, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                    current_price, status, dry_run, market_type, spread_line, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
             """, (
                 game_date, game_key, team, token_id,
                 entry_price, shares, cost_basis, model_prob,
-                entry_price, int(dry_run), timestamp,
+                entry_price, int(dry_run), market_type, spread_line, timestamp,
             ))
             con.commit()
 
@@ -175,6 +185,7 @@ class PolymarketTracker:
         exit_price: float,
         exit_reason: str,
         dry_run: bool = True,
+        market_type: str = "ML",
     ):
         """Cierra una posicion abierta y calcula P&L realizado."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -184,8 +195,8 @@ class PolymarketTracker:
                 SELECT id, entry_price, shares, cost_basis
                 FROM positions
                 WHERE game_date = ? AND game_key = ? AND team = ?
-                  AND status = 'OPEN' AND dry_run = ?
-            """, (game_date, game_key, team, int(dry_run))).fetchone()
+                  AND status = 'OPEN' AND dry_run = ? AND market_type = ?
+            """, (game_date, game_key, team, int(dry_run), market_type)).fetchone()
 
             if not row:
                 logger.warning("No open position found for %s %s %s", game_date, game_key, team)

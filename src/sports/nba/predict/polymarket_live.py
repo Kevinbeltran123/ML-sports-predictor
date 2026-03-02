@@ -1,16 +1,15 @@
-"""Live position management para Polymarket.
+"""Live position management para Polymarket (modo trading).
 
-Integra con live_betting.py para usar probabilidades ajustadas post-quarter
-y el WebSocket feed para precios en tiempo real.
+Monitoreo continuo de precios para capturar TP/SL rapidamente.
+Dos loops:
+  - Fast loop (cada 20s): check TP/SL en todas las posiciones abiertas
+  - Scoreboard (cada 60s): detectar quarter-ends para actualizar model_prob
 
 Flujo:
   1. Subscribe WebSocket para todos los token IDs de posiciones abiertas
-  2. En cada quarter end (polled desde live_betting scoreboard):
-     a. Obtener p_adjusted de multi_signal_adjustment()
-     b. Obtener current_price del WebSocket
-     c. Recomputar edge = p_adjusted - current_price
-     d. Aplicar decision tree (take_profit / stop_loss / buy_more / hold / sell)
-  3. Post-Q3: hold winners, exit losers without edge
+  2. Fast loop: evaluar TP/SL en cada posicion via WS o REST midpoint
+  3. En cada quarter end: actualizar model_prob via multi_signal_adjustment()
+  4. Post-Q3: mismas reglas de TP/SL (trading mode)
 
 Uso:
   run_polymarket_live_session(pregame_preds, tracker, bankroll=50, dry_run=True)
@@ -23,17 +22,19 @@ from datetime import datetime
 from colorama import Fore, Style, init, deinit
 
 from src.core.betting.polymarket_kelly import polymarket_ev, polymarket_kelly
-from src.core.betting.polymarket_risk import PolymarketRiskManager
+from src.core.betting.polymarket_risk import PolymarketRiskManager, TAKE_PROFIT_DELTA, STOP_LOSS_DELTA
 from src.core.betting.polymarket_tracker import PolymarketTracker
 from src.sports.nba.predict.live_betting import (
     multi_signal_adjustment,
     bayesian_q1_adjustment,
-    POLL_INTERVAL_SECONDS,
     MAX_POLL_HOURS,
 )
 from src.sports.nba.features.live_game_state import get_live_scoreboard, get_live_box_score, format_clock
 
 logger = logging.getLogger(__name__)
+
+TRADING_POLL_SECONDS = 20    # Frequency for TP/SL checks
+SCOREBOARD_INTERVAL = 60     # Frequency for quarter-end model updates
 
 
 def run_polymarket_live_session(
@@ -79,114 +80,170 @@ def run_polymarket_live_session(
             logger.warning("WebSocket feed unavailable: %s. Using REST fallback.", e)
 
     print(f"\n{'='*65}")
-    print(f"  POLYMARKET LIVE -- {datetime.now().strftime('%H:%M:%S')} | {mode}")
+    print(f"  POLYMARKET TRADING -- {datetime.now().strftime('%H:%M:%S')} | {mode}")
     print(f"  Monitoring {len(open_positions)} position(s)")
-    print(f"  (update every {POLL_INTERVAL_SECONDS}s, Ctrl+C to exit)")
+    print(f"  TP: +${TAKE_PROFIT_DELTA:.2f} | SL: -${STOP_LOSS_DELTA:.2f} | Poll: {TRADING_POLL_SECONDS}s")
+    print(f"  (Ctrl+C to exit)")
     print(f"{'='*65}\n")
 
     processed_periods: dict[str, set] = {}
     last_p_adjusted: dict[str, float] = {}
+    # Store model_prob from pregame for positions (used in TP/SL edge calc)
+    for pos in open_positions:
+        game_key = pos.get("game_key", "")
+        for pred in pregame_predictions:
+            if f"{pred['home_team']}:{pred['away_team']}" == game_key:
+                last_p_adjusted[game_key] = pred["p_pregame"]
+                break
+
     start_time = time.time()
     max_seconds = MAX_POLL_HOURS * 3600
     poll_count = 0
+    last_scoreboard_time = 0.0
 
     try:
         while True:
             elapsed = time.time() - start_time
             if elapsed > max_seconds:
-                print(f"\nPolymarket Live: timeout after {MAX_POLL_HOURS}h.")
+                print(f"\nPolymarket Trading: timeout after {MAX_POLL_HOURS}h.")
                 break
 
             poll_count += 1
-
-            live_games = get_live_scoreboard()
-            if not live_games:
-                print(f"  [poll #{poll_count}] No live data. Retrying in {POLL_INTERVAL_SECONDS}s...")
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
-
+            now = time.time()
             all_final = True
 
-            for game in live_games:
-                pred = _match_game(game, pregame_predictions)
-                if pred is None:
-                    continue
+            # ── Scoreboard check (every SCOREBOARD_INTERVAL) for model updates ──
+            if now - last_scoreboard_time >= SCOREBOARD_INTERVAL:
+                last_scoreboard_time = now
+                live_games = get_live_scoreboard()
 
-                game_id = game["game_id"]
-                game_key = f"{pred['home_team']}:{pred['away_team']}"
-                status = game["status"]
-                period = game["period"]
+                if live_games:
+                    for game in live_games:
+                        pred = _match_game(game, pregame_predictions)
+                        if pred is None:
+                            continue
 
-                if status != 3:
-                    all_final = False
+                        game_id = game["game_id"]
+                        game_key = f"{pred['home_team']}:{pred['away_team']}"
+                        status = game["status"]
+                        period = game["period"]
 
-                if game_id not in processed_periods:
-                    processed_periods[game_id] = set()
+                        if status != 3:
+                            all_final = False
 
-                # Check positions for this game
-                game_positions = [
-                    p for p in open_positions
-                    if p.get("game_key") == game_key and p.get("status") == "OPEN"
-                ]
-                if not game_positions:
-                    continue
+                        if game_id not in processed_periods:
+                            processed_periods[game_id] = set()
 
-                # Process quarter ends
-                for check_period in [1, 2, 3]:
-                    if (check_period not in processed_periods[game_id] and
-                            period > check_period and status in (2, 3)):
+                        # Process quarter ends — update model prob
+                        for check_period in [1, 2, 3]:
+                            if (check_period not in processed_periods[game_id] and
+                                    period > check_period and status in (2, 3)):
 
-                        box = get_live_box_score(game_id) if status == 2 else None
+                                box = get_live_box_score(game_id) if status == 2 else None
+                                p_pre = pred["p_pregame"]
 
-                        if status == 3 and box is None:
-                            print(
-                                f"  [AVISO] Q{check_period}: partido ya finalizado al iniciar sesion. "
-                                f"Usando solo score diff — ajuste bayesiano menos preciso."
-                            )
+                                if box is not None:
+                                    p_adj, delta, expl, conf_set = multi_signal_adjustment(
+                                        p_pre, box["home"], box["away"], period=check_period,
+                                    )
+                                else:
+                                    score_diff = game["home_score"] - game["away_score"]
+                                    total_poss = 25.0 * check_period
+                                    p_adj, expl = bayesian_q1_adjustment(p_pre, score_diff, total_poss)
 
-                        p_pre = pred["p_pregame"]
-                        if box is not None:
-                            p_adj, delta, expl, conf_set = multi_signal_adjustment(
-                                p_pre, box["home"], box["away"], period=check_period,
-                            )
-                        else:
-                            score_diff = game["home_score"] - game["away_score"]
-                            total_poss = 25.0 * check_period
-                            p_adj, expl = bayesian_q1_adjustment(p_pre, score_diff, total_poss)
+                                last_p_adjusted[game_key] = p_adj
+                                processed_periods[game_id].add(check_period)
+                                print(f"  Q{check_period} model update: {game_key} p_adj={p_adj:.1%}")
 
-                        last_p_adjusted[game_id] = p_adj
-
-                        # Evaluate exit signals for each position
-                        for pos in game_positions:
-                            _evaluate_position(
-                                pos, p_adj, check_period,
-                                ws_feed, tracker, risk_mgr, bankroll, dry_run,
-                            )
-
-                        processed_periods[game_id].add(check_period)
-
-                # Post-Q3 policy
-                if period >= 4 or status == 3:
-                    p_adj = last_p_adjusted.get(game_id, pred["p_pregame"])
-                    for pos in game_positions:
-                        _evaluate_post_q3(pos, p_adj, ws_feed, tracker, risk_mgr, dry_run)
-
-            # Status line
-            print(f"  [{datetime.now().strftime('%H:%M:%S')} poll #{poll_count}] "
-                  f"{len(open_positions)} positions | "
-                  f"exposure: ${tracker.get_total_exposure(dry_run):.2f}")
-
-            # Refresh positions
+            # ── Fast TP/SL check (every poll) ──
             open_positions = tracker.get_open_positions(dry_run=dry_run)
+            if not open_positions:
+                if all_final:
+                    _print_live_summary(tracker, dry_run)
+                    break
+                time.sleep(TRADING_POLL_SECONDS)
+                continue
 
+            exits_this_poll = 0
+            for pos in open_positions:
+                if pos.get("status") != "OPEN":
+                    continue
+
+                current_price = _get_current_price(pos, ws_feed)
+                if current_price is None:
+                    continue
+
+                entry_price = pos["entry_price"]
+                price_delta = current_price - entry_price
+
+                # Quick check: only call full evaluate if near TP/SL
+                if price_delta >= TAKE_PROFIT_DELTA or price_delta <= -STOP_LOSS_DELTA:
+                    # Compute edge with latest model_prob
+                    team = pos["team"]
+                    game_key = pos.get("game_key", "")
+                    home_team = game_key.split(":")[0] if ":" in game_key else ""
+                    model_prob = last_p_adjusted.get(game_key, pos.get("model_prob", 0.5))
+                    if team != home_team:
+                        model_prob = 1.0 - model_prob
+
+                    current_edge = polymarket_ev(model_prob, current_price)
+                    signal = risk_mgr.check_exit_signals(entry_price, current_price, current_edge)
+
+                    market_type = pos.get("market_type", "ML")
+                    spread_info = f" ({pos.get('spread_line', 0):+.1f})" if market_type == "AH" else ""
+                    action_color = Fore.GREEN if signal.action == "TAKE_PROFIT" else Fore.RED
+
+                    if signal.action in ("TAKE_PROFIT", "STOP_LOSS", "SELL_ALL"):
+                        print(f"  [{action_color}{signal.action}{Style.RESET_ALL}] "
+                              f"{team} [{market_type}{spread_info}] "
+                              f"entry=${entry_price:.3f} -> ${current_price:.3f} "
+                              f"({price_delta:+.3f})")
+                        print(f"    {signal.reason}")
+
+                        if signal.sell_fraction >= 1.0:
+                            _execute_exit(pos, current_price, signal, tracker, dry_run)
+                        else:
+                            _execute_partial_exit(pos, current_price, signal, tracker, dry_run)
+                        exits_this_poll += 1
+
+                elif abs(price_delta) >= 0.01:
+                    # Edge-based check (no TP/SL but significant movement)
+                    team = pos["team"]
+                    game_key = pos.get("game_key", "")
+                    home_team = game_key.split(":")[0] if ":" in game_key else ""
+                    model_prob = last_p_adjusted.get(game_key, pos.get("model_prob", 0.5))
+                    if team != home_team:
+                        model_prob = 1.0 - model_prob
+
+                    current_edge = polymarket_ev(model_prob, current_price)
+                    signal = risk_mgr.check_exit_signals(entry_price, current_price, current_edge)
+
+                    if signal.action in ("SELL_ALL",):
+                        market_type = pos.get("market_type", "ML")
+                        print(f"  [{Fore.RED}EDGE_EXIT{Style.RESET_ALL}] "
+                              f"{team} [{market_type}] edge={current_edge:+.1%}")
+                        _execute_exit(pos, current_price, signal, tracker, dry_run)
+                        exits_this_poll += 1
+
+            # Status line (every 5th poll to reduce noise)
+            if poll_count % 5 == 0 or exits_this_poll > 0:
+                n_open = len(tracker.get_open_positions(dry_run=dry_run))
+                exposure = tracker.get_total_exposure(dry_run)
+                realized = tracker.get_realized_pnl(dry_run)
+                print(f"  [{datetime.now().strftime('%H:%M:%S')} #{poll_count}] "
+                      f"{n_open} open | exposure: ${exposure:.2f} | "
+                      f"realized: ${realized:+.2f}")
+
+            # Check if all done
+            open_positions = tracker.get_open_positions(dry_run=dry_run)
             if all_final and not open_positions:
                 _print_live_summary(tracker, dry_run)
                 break
 
-            time.sleep(POLL_INTERVAL_SECONDS)
+            time.sleep(TRADING_POLL_SECONDS)
 
     except KeyboardInterrupt:
-        print(f"\n  Polymarket live session interrupted.")
+        print(f"\n  Polymarket trading session interrupted.")
 
     finally:
         if ws_feed:
@@ -352,6 +409,7 @@ def _execute_exit(pos, price, signal, tracker, dry_run):
         exit_price=price,
         exit_reason=signal.action,
         dry_run=dry_run,
+        market_type=pos.get("market_type", "ML"),
     )
 
     if not dry_run:
@@ -378,6 +436,10 @@ def _execute_exit(pos, price, signal, tracker, dry_run):
 
 def _execute_partial_exit(pos, price, signal, tracker, dry_run):
     """Take profit: sell fraction of position."""
+    if signal.sell_fraction >= 1.0:
+        _execute_exit(pos, price, signal, tracker, dry_run)
+        return
+
     sell_shares = int(pos["shares"] * signal.sell_fraction)
     if sell_shares <= 0:
         return

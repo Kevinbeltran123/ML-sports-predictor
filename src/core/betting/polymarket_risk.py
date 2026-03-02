@@ -1,12 +1,12 @@
 """Risk management para Polymarket NBA trading.
 
-Limites agresivos para bankroll chico ($50 USDC):
-  - Posicion individual max: 10% ($5)
+Modo trading: capturar movimiento de precio (CLV), no esperar settlement.
+  - Posicion individual max: 10% ($5 en bankroll $50)
   - Exposicion total max: 40% ($20)
   - Exposicion same-day max: 30% ($15)
   - Posiciones abiertas max: 8
-  - Stop-loss: precio cae 40% desde entry
-  - Take-profit: vender 50% a 2x entry
+  - Take-profit: +$0.05 per share (vender 100%)
+  - Stop-loss: -$0.03 per share (vender 100%)
   - Liquidez minima: $200
   - Edge minimo: 3% (model_prob - market_price >= 0.03)
 """
@@ -22,9 +22,9 @@ MAX_SINGLE_POSITION_PCT = 10.0    # % del bankroll por posicion
 MAX_TOTAL_EXPOSURE_PCT = 40.0     # % del bankroll en todas las posiciones
 MAX_SAME_DAY_EXPOSURE_PCT = 30.0  # % del bankroll en posiciones del mismo dia
 MAX_OPEN_POSITIONS = 8
-STOP_LOSS_PCT = 0.40              # Vender si precio cae 40% desde entry
-TAKE_PROFIT_MULTIPLIER = 2.0      # Vender 50% si precio llega a 2x entry
-TAKE_PROFIT_SELL_FRACTION = 0.50  # Vender 50% en take-profit
+TAKE_PROFIT_DELTA = 0.05          # Vender cuando precio sube $0.05 desde entry
+STOP_LOSS_DELTA = 0.03            # Vender cuando precio baja $0.03 desde entry
+TAKE_PROFIT_SELL_FRACTION = 1.00  # Vender 100% en take-profit (trading mode)
 MIN_LIQUIDITY_USDC = 200.0       # Liquidez minima del mercado
 MIN_EDGE = 0.03                   # Edge minimo para abrir posicion
 MIN_POSITION_USDC = 1.0           # Posicion minima viable (gas fees)
@@ -179,15 +179,15 @@ class PolymarketRiskManager:
         current_price: float,
         current_edge: float,
     ) -> ExitSignal:
-        """Determina si una posicion debe cerrarse.
+        """Determina si una posicion debe cerrarse (modo trading).
 
-        Decision tree (del plan):
-          price > 2x entry?        -> TAKE_PROFIT (sell 50%)
-          price < 60% of entry?    -> STOP_LOSS (sell all)
-          new_edge > 3%?           -> BUY_MORE (if risk allows)
-          1% < new_edge < 3%?      -> HOLD
-          new_edge < 1%?           -> SELL_ALL (edge gone)
-          new_edge < -3%?          -> SELL_ALL (edge reversed)
+        Decision tree:
+          price >= entry + TP_DELTA?  -> TAKE_PROFIT (sell 100%)
+          price <= entry - SL_DELTA?  -> STOP_LOSS (sell 100%)
+          edge > 3%?                  -> HOLD (edge fuerte)
+          1% < edge < 3%?            -> HOLD (edge marginal)
+          edge < -3%?                -> SELL_ALL (edge reversed)
+          edge < 1%?                 -> SELL_ALL (edge gone)
 
         Args:
             entry_price: precio de entrada
@@ -197,29 +197,30 @@ class PolymarketRiskManager:
         Returns:
             ExitSignal con action y sell_fraction
         """
-        # Take profit: precio duplicado
-        if current_price >= entry_price * TAKE_PROFIT_MULTIPLIER:
+        price_delta = current_price - entry_price
+
+        # Take profit: precio subio TAKE_PROFIT_DELTA desde entry
+        if price_delta >= TAKE_PROFIT_DELTA:
             return ExitSignal(
                 action="TAKE_PROFIT",
                 sell_fraction=TAKE_PROFIT_SELL_FRACTION,
-                reason=f"Price ${current_price:.2f} >= {TAKE_PROFIT_MULTIPLIER}x entry ${entry_price:.2f}",
+                reason=f"TP: +${price_delta:.3f} >= +${TAKE_PROFIT_DELTA:.2f} (entry ${entry_price:.2f} -> ${current_price:.2f})",
             )
 
-        # Stop loss: precio cayo 40%
-        stop_price = entry_price * (1.0 - STOP_LOSS_PCT)
-        if current_price <= stop_price:
+        # Stop loss: precio bajo STOP_LOSS_DELTA desde entry
+        if price_delta <= -STOP_LOSS_DELTA:
             return ExitSignal(
                 action="STOP_LOSS",
                 sell_fraction=1.0,
-                reason=f"Price ${current_price:.2f} <= stop ${stop_price:.2f} (-{STOP_LOSS_PCT:.0%})",
+                reason=f"SL: ${price_delta:.3f} <= -${STOP_LOSS_DELTA:.2f} (entry ${entry_price:.2f} -> ${current_price:.2f})",
             )
 
         # Edge-based decisions
         if current_edge >= MIN_EDGE:
             return ExitSignal(
-                action="BUY_MORE",
+                action="HOLD",
                 sell_fraction=0.0,
-                reason=f"Edge {current_edge:.1%} >= {MIN_EDGE:.0%}, can add",
+                reason=f"Edge {current_edge:.1%} >= {MIN_EDGE:.0%}, holding",
             )
 
         if 0.01 <= current_edge < MIN_EDGE:
@@ -249,30 +250,5 @@ class PolymarketRiskManager:
         current_price: float,
         current_edge: float,
     ) -> ExitSignal:
-        """Politica post-Q3: hold winners, exit losers without edge.
-
-        Despues del Q3, si la posicion es profitable la dejamos
-        ir a settlement (paga $1.00 si gana). Si esta perdiendo
-        y no hay edge, vendemos para recuperar algo.
-        """
-        is_profitable = current_price > entry_price
-
-        if is_profitable:
-            return ExitSignal(
-                action="HOLD",
-                sell_fraction=0.0,
-                reason=f"Post-Q3: profitable (${current_price:.2f} > ${entry_price:.2f}), hold to settlement",
-            )
-
-        if current_edge >= 0.01:
-            return ExitSignal(
-                action="HOLD",
-                sell_fraction=0.0,
-                reason=f"Post-Q3: losing but edge {current_edge:.1%}, hold",
-            )
-
-        return ExitSignal(
-            action="SELL_ALL",
-            sell_fraction=1.0,
-            reason=f"Post-Q3: losing and no edge ({current_edge:.1%}), exit",
-        )
+        """Politica post-Q3: en modo trading, mismas reglas de TP/SL aplican."""
+        return self.check_exit_signals(entry_price, current_price, current_edge)

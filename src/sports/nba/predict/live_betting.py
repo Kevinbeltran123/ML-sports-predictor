@@ -365,7 +365,9 @@ def _print_period_update(
     print(f"{'-' * 65}")
 
     edge_threshold = 0.04
-    if abs(delta_from_pre) >= edge_threshold:
+    if conf_set == 2:
+        print(f"  {Fore.YELLOW}SKIP: conformal incierto (set_size=2) — modelo no confia en esta prediccion{Style.RESET_ALL}")
+    elif abs(delta_from_pre) >= edge_threshold:
         if delta_from_pre > 0:
             print(f"  HINT: Si el mercado aun da {away.split()[-1]} > {p_away_adj:.0%} -> edge UNDER {away.split()[-1]}")
         else:
