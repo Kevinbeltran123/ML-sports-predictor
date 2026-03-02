@@ -103,7 +103,7 @@ def build_prediction_context(_odds_hash, sportsbook):
 
     lookups = build_all_lookups(games)
 
-    data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds = create_todays_games_data(
+    data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds, _data_margin = create_todays_games_data(
         games, df, odds, schedule_df, today,
         lookups["game_logs"], lookups["elo_ratings"], lookups["split_data"],
         lookups["team_availability"], lookups["team_schedule"],

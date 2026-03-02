@@ -19,6 +19,7 @@ from datetime import datetime
 # ──────────────────────────────────────────
 
 _TAG_MAP = {"BET": "BET", "SKIP": "SKIP", "TRAP": "TRAP", "PASS": "PASS"}
+_AH_TAG_EMOJI = {"AH-BET": "✅", "AH-SKIP": "⏭️", "AH-PASS": "❌"}
 CONF2_KELLY_THRESHOLD = 0.5
 
 
@@ -94,13 +95,18 @@ def format_pregame_message(blocks: list[dict], sportsbook: str = "fanduel") -> s
             f"σ={sigma:.3f}  {agree}XGB:{b['xgb_conf']}% Cat:{b['cat_conf']}%"
         )
 
-        # AH spread
+        # AH spread with tag
+        ah_tag = b.get("ah_tag", "AH-PASS")
+        ah_emoji = _AH_TAG_EMOJI.get(ah_tag, "•")
         if b.get("ah_side"):
             ah_side = _short(b["ah_side"])
+            blend = " (REG)" if b.get("ah_blend") == "REG+CLF" else ""
             lines.append(
-                f"   AH  {ah_side} {b['ah_line']}  "
-                f"P={b['ah_p']:.1%}  EV={b['ah_ev']:+.1f}%  K={b['ah_kelly']:.2f}%"
+                f"   AH {ah_emoji}[{ah_tag}] {ah_side} {b['ah_line']}  "
+                f"P={b['ah_p']:.1%}  EV={b['ah_ev']:+.1f}%  K={b['ah_kelly']:.2f}%{blend}"
             )
+            if ah_tag == "AH-SKIP" and b.get("ah_skip_reasons"):
+                lines.append(f"   ⚠️ {', '.join(b['ah_skip_reasons'])}")
 
         # O/U
         ou_sym = "↑" if b["ou_label"] == "OVER" else "↓"

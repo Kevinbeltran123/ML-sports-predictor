@@ -28,7 +28,7 @@ from src.core.betting import kelly_criterion as kc
 from src.core.betting.robust_kelly import calculate_robust_kelly_simple
 from src.core.betting.spread_math import p_cover, expected_margin, ah_probabilities, p_cover_regression, p_win_from_margin, p_cover_from_residual
 from src.core.betting.expected_value import ah_expected_value
-from src.sports.nba.predict.margin_runner import predict_margins, predict_margin_sigma, get_conformal_regressor, is_residual_model
+from src.sports.nba.predict.margin_runner import predict_margins, predict_margin_sigma, predict_margin_interval, get_conformal_regressor, is_residual_model
 from src.sports.nba.predict.totals_runner import predict_totals, p_over as totals_p_over, get_totals_conformal
 
 init()
@@ -49,6 +49,16 @@ _last_blocks = []
 # Rango valido de epsilon (mismo que fit_variance_model.py)
 SIGMA_MIN = 0.02
 SIGMA_MAX = 0.20
+
+# --- AH confidence filters ---
+# Filtros para reducir picks AH de baja confianza (basado en analisis de resultados):
+AH_MIN_PCOVER = 0.54     # minimo P(cover) para recomendar AH
+AH_MAX_SPREAD = 12.0     # no recomendar AH con |spread| > 12 (demasiado volatil)
+AH_MIN_KELLY = 0.3       # minimo Kelly % para mostrar pick AH
+AH_SIGMA_MAX = 0.12      # si sigma del ensemble > threshold, skip AH (modelos no concuerdan)
+AH_DOG_SPREAD_MAX = 8.0  # para underdogs: no recomendar si |spread| > 8 AND P(cover) < 58%
+AH_DOG_PCOVER_MIN = 0.58 # umbral P(cover) para underdogs con spread grande
+AH_REG_BLEND_W = 0.6     # peso del modelo de margen en blend (0.6 reg + 0.4 clf)
 
 # --- Pesos del ensemble ---
 # Evaluacion v2 en test set (809 juegos, 2025-10 a 2026-02), 188 features:
@@ -413,54 +423,21 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
         sh_odds = int(spread_home_odds[idx]) if spread_home_odds and spread_home_odds[idx] else -110
         sa_odds = int(spread_away_odds[idx]) if spread_away_odds and spread_away_odds[idx] else -110
 
-        home_ah = ah_probabilities(prob_home, line)
-        away_ah = ah_probabilities(1.0 - prob_home, -line)
-
-        ah_ev_home = float(ah_expected_value(home_ah, sh_odds))
-        ah_ev_away = float(ah_expected_value(away_ah, sa_odds))
-        p_home_cover = home_ah["p_full_win"] + home_ah["p_half_win"]
-        p_away_cover = away_ah["p_full_win"] + away_ah["p_half_win"]
-        ah_kelly_home = float(calculate_robust_kelly_simple(sh_odds, p_home_cover, epsilon=sigma_i))
-        ah_kelly_away = float(calculate_robust_kelly_simple(sa_odds, p_away_cover, epsilon=sigma_i))
-
-        if ah_ev_home > ah_ev_away and ah_ev_home > 0:
-            b["ah_side"] = home_team
-            b["ah_line"] = f"{line:+.1f}"
-            b["ah_ev"] = ah_ev_home
-            b["ah_p"] = p_home_cover
-            b["ah_kelly"] = ah_kelly_home
-        elif ah_ev_away > 0:
-            b["ah_side"] = away_team
-            b["ah_line"] = f"{-line:+.1f}"
-            b["ah_ev"] = ah_ev_away
-            b["ah_p"] = p_away_cover
-            b["ah_kelly"] = ah_kelly_away
-        else:
-            b["ah_side"] = None
-            b["ah_ev"] = max(ah_ev_home, ah_ev_away)
-            b["ah_p"] = max(p_home_cover, p_away_cover)
-            b["ah_kelly"] = 0.0
-            b["ah_line"] = f"{line:+.1f}"
-
-        b["ah_is_quarter"] = home_ah["is_quarter"]
-
-        # --- Margin regression ---
+        # --- Margin regression (compute first, needed for AH blend) ---
+        reg_p_home_cover = None
+        reg_p_away_cover = None
         if reg_margins is not None:
             raw_pred = float(reg_margins[idx])
             reg_sigma_val = float(reg_sigmas[idx]) if reg_sigmas is not None else None
             b["reg_sigma"] = reg_sigma_val
 
             if is_residual_model():
-                # Camino B: model outputs residual = margin + spread
                 b["reg_residual"] = raw_pred
-                b["reg_margin"] = raw_pred - line  # convert back to raw margin
-                b["reg_p_cover"] = p_cover_from_residual(raw_pred, sigma=reg_sigma_val) if reg_sigma_val else 0.5
-
-                # For AH EV: use residual-based P(cover)
+                b["reg_margin"] = raw_pred - line
+                b["reg_p_cover"] = p_cover_from_residual(raw_pred, sigma=reg_sigma_val, line=line) if reg_sigma_val else 0.5
                 reg_p_home_cover = b["reg_p_cover"]
-                reg_p_away_cover = p_cover_from_residual(-raw_pred, sigma=reg_sigma_val) if reg_sigma_val else 0.5
+                reg_p_away_cover = p_cover_from_residual(-raw_pred, sigma=reg_sigma_val, line=-line) if reg_sigma_val else 0.5
 
-                # Conformal: simpler check for residual model
                 conformal_reg = get_conformal_regressor()
                 if conformal_reg is not None:
                     b["reg_confident"] = conformal_reg.is_confident_residual(raw_pred)
@@ -469,12 +446,10 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
                     b["reg_confident"] = None
                     b["reg_conf_margin"] = None
             else:
-                # Legacy: raw margin model
                 mu_reg = raw_pred
                 b["reg_residual"] = None
                 b["reg_margin"] = mu_reg
                 b["reg_p_cover"] = p_cover_regression(mu_reg, line, sigma=reg_sigma_val)
-
                 reg_p_home_cover = b["reg_p_cover"]
                 reg_p_away_cover = p_cover_regression(-mu_reg, -line, sigma=reg_sigma_val)
 
@@ -486,7 +461,6 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
                     b["reg_confident"] = None
                     b["reg_conf_margin"] = None
 
-            # AH EV override with regression-based P(cover)
             reg_ah_ev_home = float(ah_expected_value(
                 {"p_full_win": reg_p_home_cover, "p_half_win": 0.0,
                  "p_half_loss": 0.0, "p_full_loss": 1.0 - reg_p_home_cover,
@@ -495,7 +469,6 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
                 {"p_full_win": reg_p_away_cover, "p_half_win": 0.0,
                  "p_half_loss": 0.0, "p_full_loss": 1.0 - reg_p_away_cover,
                  "is_quarter": False}, sa_odds))
-
             b["reg_ah_ev_home"] = reg_ah_ev_home
             b["reg_ah_ev_away"] = reg_ah_ev_away
             b["reg_p_home_cover"] = reg_p_home_cover
@@ -504,6 +477,102 @@ def _build_game_blocks(games, ml_probs, ou_probs, xgb_ml_probs, cat_ml_probs,
             b["reg_margin"] = None
             b["reg_residual"] = None
             b["reg_sigma"] = None
+
+        # --- AH probabilities (ML classifier-based) ---
+        home_ah = ah_probabilities(prob_home, line)
+        away_ah = ah_probabilities(1.0 - prob_home, -line)
+
+        clf_p_home_cover = home_ah["p_full_win"] + home_ah["p_half_win"]
+        clf_p_away_cover = away_ah["p_full_win"] + away_ah["p_half_win"]
+
+        # Blend: if margin model is available and confident, weight it 60/40
+        if reg_p_home_cover is not None and b.get("reg_confident"):
+            p_home_cover = AH_REG_BLEND_W * reg_p_home_cover + (1 - AH_REG_BLEND_W) * clf_p_home_cover
+            p_away_cover = AH_REG_BLEND_W * reg_p_away_cover + (1 - AH_REG_BLEND_W) * clf_p_away_cover
+            b["ah_blend"] = "REG+CLF"
+        else:
+            p_home_cover = clf_p_home_cover
+            p_away_cover = clf_p_away_cover
+            b["ah_blend"] = "CLF"
+
+        # Recompute AH EV with blended probabilities
+        blended_home_ah = {"p_full_win": p_home_cover, "p_half_win": 0.0,
+                           "p_half_loss": 0.0, "p_full_loss": 1.0 - p_home_cover,
+                           "is_quarter": home_ah["is_quarter"]}
+        blended_away_ah = {"p_full_win": p_away_cover, "p_half_win": 0.0,
+                           "p_half_loss": 0.0, "p_full_loss": 1.0 - p_away_cover,
+                           "is_quarter": away_ah["is_quarter"]}
+
+        ah_ev_home = float(ah_expected_value(blended_home_ah, sh_odds))
+        ah_ev_away = float(ah_expected_value(blended_away_ah, sa_odds))
+        ah_kelly_home = float(calculate_robust_kelly_simple(sh_odds, p_home_cover, epsilon=sigma_i))
+        ah_kelly_away = float(calculate_robust_kelly_simple(sa_odds, p_away_cover, epsilon=sigma_i))
+
+        # Pick best side
+        if ah_ev_home > ah_ev_away and ah_ev_home > 0:
+            b["ah_side"] = home_team
+            b["ah_line"] = f"{line:+.1f}"
+            b["ah_ev"] = ah_ev_home
+            b["ah_p"] = p_home_cover
+            b["ah_kelly"] = ah_kelly_home
+            ah_is_home_pick = True
+        elif ah_ev_away > 0:
+            b["ah_side"] = away_team
+            b["ah_line"] = f"{-line:+.1f}"
+            b["ah_ev"] = ah_ev_away
+            b["ah_p"] = p_away_cover
+            b["ah_kelly"] = ah_kelly_away
+            ah_is_home_pick = False
+        else:
+            b["ah_side"] = None
+            b["ah_ev"] = max(ah_ev_home, ah_ev_away)
+            b["ah_p"] = max(p_home_cover, p_away_cover)
+            b["ah_kelly"] = 0.0
+            b["ah_line"] = f"{line:+.1f}"
+            ah_is_home_pick = None
+
+        b["ah_is_quarter"] = home_ah["is_quarter"]
+
+        # --- AH confidence tag (independent of ML tag) ---
+        ah_skip_reasons = []
+
+        if b["ah_side"] is None:
+            b["ah_tag"] = "AH-PASS"
+        else:
+            # Filter 1: spread too large
+            if abs(line) > AH_MAX_SPREAD:
+                ah_skip_reasons.append(f"|spread|={abs(line):.1f}>{AH_MAX_SPREAD}")
+
+            # Filter 2: P(cover) too low
+            if b["ah_p"] < AH_MIN_PCOVER:
+                ah_skip_reasons.append(f"P={b['ah_p']:.1%}<{AH_MIN_PCOVER:.0%}")
+
+            # Filter 3: Kelly too low
+            if b["ah_kelly"] < AH_MIN_KELLY:
+                ah_skip_reasons.append(f"Kelly={b['ah_kelly']:.2f}%<{AH_MIN_KELLY}%")
+
+            # Filter 4: ensemble sigma too high (models disagree)
+            if sigma_i > AH_SIGMA_MAX:
+                ah_skip_reasons.append(f"σ={sigma_i:.3f}>{AH_SIGMA_MAX}")
+
+            # Filter 5: underdog with large spread
+            is_underdog_pick = (ah_is_home_pick and line > 0) or (ah_is_home_pick is False and line < 0)
+            if is_underdog_pick and abs(line) > AH_DOG_SPREAD_MAX and b["ah_p"] < AH_DOG_PCOVER_MIN:
+                ah_skip_reasons.append(f"dog |spread|={abs(line):.1f} P={b['ah_p']:.1%}")
+
+            # Filter 6: ML and margin model disagree on AH side
+            if reg_p_home_cover is not None:
+                clf_side_home = clf_p_home_cover > clf_p_away_cover
+                reg_side_home = reg_p_home_cover > reg_p_away_cover
+                if clf_side_home != reg_side_home:
+                    ah_skip_reasons.append("CLF↔REG disagree")
+
+            if ah_skip_reasons:
+                b["ah_tag"] = "AH-SKIP"
+                b["ah_skip_reasons"] = ah_skip_reasons
+            else:
+                b["ah_tag"] = "AH-BET"
+                b["ah_skip_reasons"] = []
 
         blocks.append(b)
 
@@ -581,19 +650,33 @@ def _print_compact_output(blocks, kelly_flag, conformal=None, has_sigma=False):
             f"  {sigma_color}σ={s:.3f}{Style.RESET_ALL}"
         )
 
-        # --- Line 3: AH ---
+        # --- Line 3: AH with tag ---
+        ah_tag = b.get("ah_tag", "AH-PASS")
+        if ah_tag == "AH-BET":
+            ah_tag_str = f"{Fore.GREEN}AH-BET{Style.RESET_ALL}"
+        elif ah_tag == "AH-SKIP":
+            ah_tag_str = f"{Fore.YELLOW}AH-SKIP{Style.RESET_ALL}"
+        else:
+            ah_tag_str = f"{Fore.RED}AH-PASS{Style.RESET_ALL}"
+
+        blend_str = f" ({b.get('ah_blend', 'CLF')})" if b.get("ah_blend") == "REG+CLF" else ""
+
         if b["ah_side"]:
             ah_ev_color = Fore.GREEN if b["ah_ev"] > 0 else Fore.RED
             q_tag = " Q" if b["ah_is_quarter"] else ""
             print(
-                f"       AH  {b['ah_side']} ({b['ah_line']}{q_tag}): "
+                f"       AH  [{ah_tag_str}] {b['ah_side']} ({b['ah_line']}{q_tag}): "
                 f"P={b['ah_p']:.1%} EV={ah_ev_color}{b['ah_ev']:+.1f}{Style.RESET_ALL} "
                 f"Kelly={b['ah_kelly']:.2f}%"
-                f"  margin={b['margin']:+.1f}"
+                f"  margin={b['margin']:+.1f}{blend_str}"
             )
+            # Show skip reasons if AH-SKIP
+            if ah_tag == "AH-SKIP" and b.get("ah_skip_reasons"):
+                reasons = ", ".join(b["ah_skip_reasons"])
+                print(f"           {Fore.YELLOW}! AH skip: {reasons}{Style.RESET_ALL}")
         else:
             print(
-                f"       AH  --- spread {b['ah_line']}, margin={b['margin']:+.1f}"
+                f"       AH  [{ah_tag_str}] spread {b['ah_line']}, margin={b['margin']:+.1f}"
                 f"  EV={b['ah_ev']:+.1f}"
             )
 
@@ -605,14 +688,12 @@ def _print_compact_output(blocks, kelly_flag, conformal=None, has_sigma=False):
                 reg_conf_str = f"  [{conf_tag}{Style.RESET_ALL} Δ={b['reg_conf_margin']:+.1f}]"
             sigma_str = f" σ={b['reg_sigma']:.1f}" if b.get("reg_sigma") else ""
             if b.get("reg_residual") is not None:
-                # Camino B: show residual + converted margin
                 print(
                     f"           CLF: μ={b['margin']:+.1f}  |  "
                     f"REG: res={b['reg_residual']:+.1f} μ={b['reg_margin']:+.1f} "
                     f"P(cover)={b['reg_p_cover']:.1%}{sigma_str}{reg_conf_str}"
                 )
             else:
-                # Legacy: raw margin
                 print(
                     f"           CLF: μ={b['margin']:+.1f}  |  "
                     f"REG: μ={b['reg_margin']:+.1f} P(cover)={b['reg_p_cover']:.1%}{sigma_str}{reg_conf_str}"
@@ -749,6 +830,20 @@ def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_t
         entry["ah_kelly_home"] = float(calculate_robust_kelly_simple(sh_odds, p_home_profit, epsilon=eps))
         entry["ah_kelly_away"] = float(calculate_robust_kelly_simple(sa_odds, p_away_profit, epsilon=eps))
 
+        # --- AH tag (confidence filter) ---
+        ah_best_p = max(p_home_profit, p_away_profit)
+        ah_best_kelly = max(entry["ah_kelly_home"], entry["ah_kelly_away"])
+        ah_best_ev = max(entry["ah_ev_home"], entry["ah_ev_away"])
+        ah_sigma = sigma_i if sigma_i is not None else 0.05
+        ah_skip = (
+            ah_best_ev <= 0
+            or abs(line) > AH_MAX_SPREAD
+            or ah_best_p < AH_MIN_PCOVER
+            or ah_best_kelly < AH_MIN_KELLY
+            or ah_sigma > AH_SIGMA_MAX
+        )
+        entry["ah_tag"] = "AH-PASS" if ah_best_ev <= 0 else ("AH-SKIP" if ah_skip else "AH-BET")
+
         # --- Margin Regression (si disponible) ---
         if reg_margins is not None:
             raw_pred = float(reg_margins[idx])
@@ -769,7 +864,7 @@ def _build_prediction_results(games, ml_probs, ou_probs, todays_games_uo, home_t
     return result
 
 
-def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, kelly_criterion, market_info=None, spread_home_odds=None, spread_away_odds=None, sportsbook=None):
+def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, kelly_criterion, market_info=None, spread_home_odds=None, spread_away_odds=None, sportsbook=None, data_margin=None):
     """Ejecuta predicciones combinadas de XGBoost 60% + CatBoost 40%.
 
     Con conformal prediction (si ensemble_conformal.pkl existe):
@@ -809,7 +904,15 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
                      sigmas.mean(), sigmas.std(), sigmas.min(), sigmas.max())
 
     # --- Margin regression model (opcional) ---
-    reg_margins = predict_margins(data)
+    reg_margins = None
+    if data_margin is not None:
+        logger.info("Margin model: using dedicated margin features (%d cols)", data_margin.shape[1])
+        try:
+            reg_margins = predict_margins(data_margin)
+        except Exception as e:
+            logger.warning("Margin prediction failed: %s", e)
+    else:
+        logger.warning("Margin model: no dedicated features available, skipping")
     reg_sigmas = None
     if reg_margins is not None:
         logger.info("Margin model: mean=%.1f, std=%.1f, range=[%.1f, %.1f]",
@@ -817,6 +920,12 @@ def ensemble_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away
         # Sigma calibrado por bucket de spread
         spreads = market_info.get("MARKET_SPREAD", np.zeros(len(games)))
         reg_sigmas = predict_margin_sigma(spreads)
+        # Quantile interval (Q10/Q90) for uncertainty estimation
+        interval_result = predict_margin_interval(margin_input)
+        if interval_result is not None:
+            q10, q90, interval_width = interval_result
+            logger.info("Margin interval: mean_width=%.1f, range=[%.1f, %.1f]",
+                         interval_width.mean(), interval_width.min(), interval_width.max())
 
     # --- Output compacto: un bloque por partido, rankeado por EV ---
     blocks = _build_game_blocks(

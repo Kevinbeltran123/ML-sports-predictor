@@ -1,7 +1,15 @@
 """Conversión P(win) → P(cover spread) para Asian Handicap.
 
-Modelo: el margen de victoria M ~ N(μ, σ²) donde:
-  μ = σ × Φ⁻¹(P_win)    (margen esperado en puntos)
+Modelo: el margen de victoria M ~ t(μ, σ², df) donde:
+  μ = σ × t⁻¹(P_win, df)    (margen esperado en puntos)
+
+Usa distribución t-Student en vez de Normal para capturar colas gruesas
+(blowouts y upsets dramáticos). df adaptativo por magnitud del spread:
+  |spread| 0-2:  df=8   (casi Normal, juegos cerrados)
+  |spread| 2-5:  df=7   (colas ligeramente más gruesas)
+  |spread| 5-8:  df=6   (favoritos moderados, más varianza en colas)
+  |spread| 8-12: df=5   (favoritos grandes, blowouts frecuentes)
+  |spread| 12+:  df=4   (favoritos enormes, máxima incertidumbre en colas)
 
 σ es ADAPTATIVO por magnitud del spread (calibrado con 46K+ juegos NBA 2012-2026):
   |spread| 0-2:  σ=13.0  (pick'em, menos varianza)
@@ -14,7 +22,7 @@ El σ=12 comúnmente citado subestima la variabilidad real (~14 global).
 La NBA moderna (2023-26) tiene σ≈15.6, tendencia creciente desde 2012.
 
 Home cubre spread L cuando M > -L (margen supera los puntos que da).
-  P(cubrir L) = P(M > -L) = Φ((μ + L) / σ) = Φ(Φ⁻¹(P_win) + L/σ)
+  P(cubrir L) = P(M > -L) = T_df((μ + L) / σ)
 
 Convención: line negativa = home favorito (ej: -5.5 = home da 5.5 puntos).
 
@@ -26,7 +34,7 @@ Quarter lines (ej: -5.25, -5.75):
 """
 
 import numpy as np
-from scipy.stats import norm
+from scipy.stats import norm, t as t_dist
 
 # Sigma por bucket de |spread|, calibrado con OddsData.sqlite (46K juegos, 2012-2026).
 # Tendencia clara: favoritos grandes → más varianza (blowouts o upsets dramáticos).
@@ -51,6 +59,26 @@ _WNBA_SIGMA_BUCKETS = [
 ]
 WNBA_MARGIN_SIGMA = 11.0
 
+# Grados de libertad de t-Student por bucket de |spread|.
+# Spreads grandes → df más bajo → colas más gruesas → menos confianza en AH.
+_DF_BUCKETS = [
+    (2.0, 8),    # pick'em: casi Normal
+    (5.0, 7),    # favoritos leves
+    (8.0, 6),    # favoritos moderados
+    (12.0, 5),   # favoritos grandes: blowouts frecuentes
+    (float("inf"), 4),  # favoritos enormes: máxima incertidumbre
+]
+_DEFAULT_DF = 6  # fallback global
+
+
+def _df_for_line(line):
+    """Retorna grados de libertad de t-Student según magnitud del spread."""
+    abs_line = abs(line)
+    for threshold, df in _DF_BUCKETS:
+        if abs_line <= threshold:
+            return df
+    return _DEFAULT_DF
+
 
 def _sigma_for_line(line, league="nba"):
     """Retorna σ calibrado según la magnitud del spread."""
@@ -63,13 +91,17 @@ def _sigma_for_line(line, league="nba"):
     return fallback
 
 
-def p_cover(p_win, line, sigma=None):
+def p_cover(p_win, line, sigma=None, distribution="t"):
     """Convierte P(ganar) → P(cubrir spread) para el home team.
+
+    Usa t-Student por default (colas gruesas para capturar blowouts/upsets).
+    Normal disponible como fallback.
 
     Args:
         p_win: probabilidad de ganar (0-1), del ensemble
         line: spread del local (negativo = favorito). Ej: -5.5
         sigma: override manual. Si None, usa σ adaptativo por bucket.
+        distribution: "t" (default, t-Student) o "normal" (legacy).
 
     Returns:
         P(home cubre spread), clipeada a [0.01, 0.99]
@@ -78,9 +110,16 @@ def p_cover(p_win, line, sigma=None):
         return 0.5
     if sigma is None:
         sigma = _sigma_for_line(line)
-    z_win = norm.ppf(p_win)
-    z_cover = z_win + line / sigma
-    return float(np.clip(norm.cdf(z_cover), 0.01, 0.99))
+
+    if distribution == "t":
+        df = _df_for_line(line)
+        z_win = t_dist.ppf(p_win, df)
+        z_cover = z_win + line / sigma
+        return float(np.clip(t_dist.cdf(z_cover, df), 0.01, 0.99))
+    else:
+        z_win = norm.ppf(p_win)
+        z_cover = z_win + line / sigma
+        return float(np.clip(norm.cdf(z_cover), 0.01, 0.99))
 
 
 def is_quarter_line(line):
@@ -291,48 +330,56 @@ def ah_probabilities(p_win, line, sigma=None):
         }
 
 
-def expected_margin(p_win, sigma=NBA_MARGIN_SIGMA):
-    """Margen esperado en puntos: E[margen] = σ × Φ⁻¹(p_win).
+def expected_margin(p_win, sigma=NBA_MARGIN_SIGMA, distribution="t"):
+    """Margen esperado en puntos: E[margen] = σ × F⁻¹(p_win).
 
     Positivo = home gana por X puntos.
     Negativo = home pierde por X puntos.
     """
     if p_win <= 0.0 or p_win >= 1.0:
         return 0.0
+    if distribution == "t":
+        return float(sigma * t_dist.ppf(p_win, _DEFAULT_DF))
     return float(sigma * norm.ppf(p_win))
 
 
-def p_cover_from_residual(residual, sigma):
+def p_cover_from_residual(residual, sigma, distribution="t", line=0.0):
     """P(cover) directly from residual prediction (Camino B).
 
     Residual = Margin + MARKET_SPREAD. Home covers when residual > 0.
-    P(cover) = Φ(residual / σ)
+    P(cover) = T_df(residual / σ)
 
     Args:
         residual: predicted residual (positive = home covers).
         sigma: uncertainty from sigma buckets.
+        distribution: "t" (default) o "normal" (legacy).
+        line: spread line for df selection (only used with t-Student).
 
     Returns:
         P(home covers spread), clipped to [0.01, 0.99].
     """
     z = residual / sigma
+    if distribution == "t":
+        df = _df_for_line(line)
+        return float(np.clip(t_dist.cdf(z, df), 0.01, 0.99))
     return float(np.clip(norm.cdf(z), 0.01, 0.99))
 
 
-def p_cover_regression(mu, line, sigma=None):
+def p_cover_regression(mu, line, sigma=None, distribution="t"):
     """P(cover spread) usando μ del regresor en vez de P(win).
 
     A diferencia de p_cover() que calcula μ indirectamente via P(win),
     aqui μ viene directamente del regresor XGBoost.
 
     Math:
-        M ~ N(μ, σ²)
-        Home cubre cuando M > -L → P(cover) = Φ((μ + L) / σ)
+        M ~ t(μ, σ², df)
+        Home cubre cuando M > -L → P(cover) = T_df((μ + L) / σ)
 
     Args:
         mu: margen esperado en puntos (positivo = home gana)
         line: spread del local (negativo = favorito). Ej: -5.5
         sigma: override. Si None, usa σ adaptativo por bucket.
+        distribution: "t" (default) o "normal" (legacy).
 
     Returns:
         P(home cubre spread), clipeada a [0.01, 0.99]
@@ -340,13 +387,18 @@ def p_cover_regression(mu, line, sigma=None):
     if sigma is None:
         sigma = _sigma_for_line(line)
     z = (mu + line) / sigma
+    if distribution == "t":
+        df = _df_for_line(line)
+        return float(np.clip(t_dist.cdf(z, df), 0.01, 0.99))
     return float(np.clip(norm.cdf(z), 0.01, 0.99))
 
 
-def p_win_from_margin(mu, sigma=NBA_MARGIN_SIGMA):
-    """Inversa de expected_margin: P(win) = Φ(μ / σ).
+def p_win_from_margin(mu, sigma=NBA_MARGIN_SIGMA, distribution="t"):
+    """Inversa de expected_margin: P(win) = T_df(μ / σ).
 
     Util para comparar el regresor con el clasificador:
     si el regresor predice μ=+5.0, esto equivale a P(win) ≈ 64%.
     """
+    if distribution == "t":
+        return float(np.clip(t_dist.cdf(mu / sigma, _DEFAULT_DF), 0.01, 0.99))
     return float(np.clip(norm.cdf(mu / sigma), 0.01, 0.99))

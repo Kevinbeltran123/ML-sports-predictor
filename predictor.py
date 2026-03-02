@@ -94,9 +94,11 @@ from src.config import (
     PROJECT_ROOT,
     SCHEDULES_DIR,
     DROP_COLUMNS_ML,
+    DROP_COLUMNS_MARGIN,
     POLYMARKET_DEFAULT_BANKROLL,
     get_logger,
 )
+from scripts.build_margin_features import add_margin_interactions
 
 logger = get_logger(__name__)
 
@@ -108,6 +110,11 @@ SCHEDULE_PATH = SCHEDULES_DIR / "nba-2025-UTC.csv"
 # Columnas a eliminar en prediccion: debe coincidir EXACTAMENTE con
 # DROP_COLUMNS_ML del entrenamiento + metadata de prediccion (TEAM_ID).
 PREDICTION_DROP = DROP_COLUMNS_ML + [
+    'TEAM_ID', 'TEAM_ID.1',
+]
+
+# Margin model uses more features than ML (keeps injury, ESPN, lineup, etc.)
+MARGIN_PREDICTION_DROP = DROP_COLUMNS_MARGIN + [
     'TEAM_ID', 'TEAM_ID.1',
 ]
 
@@ -283,7 +290,12 @@ def _add_market_features(games_df, spread_values, home_odds, away_odds):
 
 
 def _prepare_prediction_matrix(games_df):
-    """Elimina metadata + features redundantes y convierte a float array."""
+    """Elimina metadata + features redundantes y convierte a float array.
+
+    Returns:
+        (data, frame_ml, market_info, data_margin)
+        data_margin: numpy array con features para el modelo de margen (más features que ML).
+    """
     market_info = {}
     if "MARKET_SPREAD" in games_df.columns:
         market_info["MARKET_SPREAD"] = games_df["MARKET_SPREAD"].values.copy()
@@ -297,8 +309,29 @@ def _prepare_prediction_matrix(games_df):
     logger.debug("Diff_TS_PCT: TS_PCT available=%s, Diff_TS_PCT in frame=%s", has_ts, "Diff_TS_PCT" in games_df.columns)
 
     frame_ml = games_df.drop(columns=PREDICTION_DROP, errors='ignore')
-    logger.info("Feature matrix: %d features", frame_ml.shape[1])
-    return frame_ml.values.astype(float), frame_ml, market_info
+    logger.info("Feature matrix ML: %d features", frame_ml.shape[1])
+
+    # --- Margin model: more features + interaction columns ---
+    try:
+        from src.sports.nba.predict.margin_runner import get_feature_columns
+        frame_margin_df = add_margin_interactions(games_df)
+        frame_margin_df = frame_margin_df.drop(columns=MARGIN_PREDICTION_DROP, errors='ignore')
+        # Align column order with training (critical for positional XGBoost)
+        expected_cols = get_feature_columns()
+        if expected_cols:
+            missing = [c for c in expected_cols if c not in frame_margin_df.columns]
+            if missing:
+                logger.warning("Margin: %d missing features (filling 0): %s", len(missing), missing[:5])
+                for c in missing:
+                    frame_margin_df[c] = 0.0
+            frame_margin_df = frame_margin_df[expected_cols]
+        data_margin = frame_margin_df.values.astype(float)
+        logger.info("Feature matrix Margin: %d features (aligned=%s)", frame_margin_df.shape[1], expected_cols is not None)
+    except Exception as e:
+        logger.warning("Margin feature build failed, fallback to ML features: %s", e)
+        data_margin = None
+
+    return frame_ml.values.astype(float), frame_ml, market_info, data_margin
 
 
 def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
@@ -504,9 +537,9 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     games_data_frame = add_referee_features_to_frame(games_data_frame, referee_features_list)
     games_data_frame = add_four_factors_to_frame(games_data_frame, ff_features_list)
 
-    data, frame_ml, market_info = _prepare_prediction_matrix(games_data_frame)
+    data, frame_ml, market_info, data_margin = _prepare_prediction_matrix(games_data_frame)
 
-    return data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds
+    return data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds, data_margin
 
 
 def load_schedule():
@@ -553,7 +586,8 @@ def resolve_games(odds, sportsbook):
 
 
 def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, args,
-               odds=None, market_info=None, spread_home_odds=None, spread_away_odds=None):
+               odds=None, market_info=None, spread_home_odds=None, spread_away_odds=None,
+               data_margin=None):
     predictions = None
     use_ensemble = args.ensemble or (args.odds and not args.xgb)
     use_kelly = args.kelly or use_ensemble  # kelly always on with ensemble
@@ -566,6 +600,7 @@ def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team
             spread_home_odds=spread_home_odds,
             spread_away_odds=spread_away_odds,
             sportsbook=args.odds,
+            data_margin=data_margin,
         )
         print("-------------------------------------------------------")
     if args.xgb:
@@ -667,7 +702,7 @@ def main(args, odds_cache=None):
 
     lookups = build_all_lookups(games)
 
-    data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds = create_todays_games_data(
+    data, todays_games_uo, frame_ml, home_team_odds, away_team_odds, market_info, spread_home_odds, spread_away_odds, data_margin = create_todays_games_data(
         games, df, odds, schedule_df, today,
         lookups["game_logs"], lookups["elo_ratings"], lookups["split_data"],
         lookups["team_availability"], lookups["team_schedule"],
@@ -689,6 +724,7 @@ def main(args, odds_cache=None):
         market_info=market_info,
         spread_home_odds=spread_home_odds,
         spread_away_odds=spread_away_odds,
+        data_margin=data_margin,
     )
 
     # --- Save predictions + opening lines ---

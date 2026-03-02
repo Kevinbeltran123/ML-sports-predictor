@@ -29,12 +29,15 @@ logger = get_logger(__name__)
 
 _xgb_margin = None
 _cat_margin = None
+_xgb_q10 = None  # Quantile 10% model
+_xgb_q90 = None  # Quantile 90% model
 _conformal_reg = None
 _sigma_buckets = None
+_feature_columns = None  # Expected feature order from training
 _is_residual = False
 _load_attempted = False
 
-W_XGB = 0.60
+W_XGB = 0.60  # Default, overridden by metadata.json if present
 W_CAT = 0.40
 
 # Fallback global sigma (NBA historical)
@@ -42,8 +45,8 @@ FALLBACK_SIGMA = 14.3
 
 
 def _load_margin_models():
-    """Carga modelos de margen XGBoost + CatBoost (lazy, una sola vez)."""
-    global _xgb_margin, _cat_margin, _conformal_reg, _sigma_buckets, _is_residual, _load_attempted
+    """Carga modelos de margen XGBoost + CatBoost + Quantile Q10/Q90 (lazy, una sola vez)."""
+    global _xgb_margin, _cat_margin, _xgb_q10, _xgb_q90, _conformal_reg, _sigma_buckets, _feature_columns, _is_residual, _load_attempted, W_XGB, W_CAT
     if _load_attempted:
         return _xgb_margin is not None
     _load_attempted = True
@@ -83,6 +86,23 @@ def _load_margin_models():
     else:
         logger.debug("No margin CatBoost model found — using XGBoost only")
 
+    # Quantile models (Q10 / Q90) — optional, trained by train_margin_models.py
+    q10_candidates = list(NBA_MARGIN_MODELS_DIR.glob("*MARGIN_Q10*.json"))
+    if q10_candidates:
+        best_q10 = max(q10_candidates, key=lambda p: p.stat().st_mtime)
+        b10 = xgb.Booster()
+        b10.load_model(str(best_q10))
+        _xgb_q10 = b10
+        logger.info("Margin Q10 loaded: %s", best_q10.name)
+
+    q90_candidates = list(NBA_MARGIN_MODELS_DIR.glob("*MARGIN_Q90*.json"))
+    if q90_candidates:
+        best_q90 = max(q90_candidates, key=lambda p: p.stat().st_mtime)
+        b90 = xgb.Booster()
+        b90.load_model(str(best_q90))
+        _xgb_q90 = b90
+        logger.info("Margin Q90 loaded: %s", best_q90.name)
+
     # Conformal regression
     conf_path = NBA_MARGIN_MODELS_DIR / "margin_conformal.pkl"
     if conf_path.exists():
@@ -92,7 +112,7 @@ def _load_margin_models():
         except Exception as e:
             logger.warning("Error loading margin conformal: %s", e)
 
-    # Sigma buckets + target type from metadata
+    # Sigma buckets + target type + weights from metadata
     meta_path = NBA_MARGIN_MODELS_DIR / "metadata.json"
     if meta_path.exists():
         try:
@@ -106,10 +126,27 @@ def _load_margin_models():
                 logger.info("Margin model: RESIDUAL target (Camino B)")
             else:
                 logger.info("Margin model: raw margin target (legacy)")
+            # Load ensemble weights from metadata (Optuna-tuned)
+            weights = meta.get("weights", {})
+            if "xgb" in weights and "cat" in weights:
+                W_XGB = weights["xgb"]
+                W_CAT = weights["cat"]
+                logger.info("Margin weights from metadata: XGB=%.2f, CAT=%.2f", W_XGB, W_CAT)
+            # Load feature column order (critical for positional alignment)
+            fc = meta.get("feature_columns")
+            if fc:
+                _feature_columns = fc
+                logger.info("Margin feature columns loaded: %d", len(_feature_columns))
         except Exception as e:
             logger.warning("Error loading margin metadata: %s", e)
 
     return True
+
+
+def get_feature_columns():
+    """Returns expected feature column order from training, or None if not available."""
+    _load_margin_models()
+    return _feature_columns
 
 
 def is_residual_model():
@@ -176,6 +213,31 @@ def predict_margin_sigma(spread_lines):
         prev_edge = edge
 
     return sigmas
+
+
+def predict_margin_interval(data):
+    """Retorna intervalo de prediccion [Q10, Q90] para cada juego.
+
+    Usa modelos XGBoost quantile (entrenados con objective=reg:quantileerror).
+    El interval_width = Q90 - Q10 sirve como medida de incertidumbre:
+      - Ancho < 15pts → alta certeza → mayor confianza AH
+      - Ancho > 25pts → alta incertidumbre → reducir Kelly AH
+
+    Args:
+        data: numpy array (N, num_features), mismas features que predict_margins().
+
+    Returns:
+        tuple: (q10, q90, interval_width) — arrays (N,) o None si no hay modelos.
+    """
+    _load_margin_models()
+    if _xgb_q10 is None or _xgb_q90 is None:
+        return None
+
+    dmatrix = xgb.DMatrix(data)
+    q10 = _xgb_q10.predict(dmatrix)
+    q90 = _xgb_q90.predict(dmatrix)
+    interval_width = q90 - q10
+    return q10, q90, interval_width
 
 
 def get_conformal_regressor():

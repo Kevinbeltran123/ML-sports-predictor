@@ -27,19 +27,20 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 
 from src.core.calibration.conformal_regression import ConformalRegressor
-from src.config import DATASET_DB, NBA_MARGIN_MODELS_DIR, DROP_COLUMNS_ML, get_logger
+from src.config import DATASET_DB, NBA_MARGIN_MODELS_DIR, DROP_COLUMNS_MARGIN, get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_DATASET = "dataset_2012-26"
+# Use enriched dataset (built by scripts/build_margin_features.py).
+# Falls back to base dataset if enriched not available.
+DEFAULT_DATASET = "dataset_margin_enriched"
+FALLBACK_DATASET = "dataset_2012-26"
 TARGET = "Residual"  # was "Margin" — now predicts spread residual
 DATE_COL = "Date"
 
-# Columns to drop for margin regression.
-# MARKET_SPREAD stays in DROP list — we do NOT want spread as a feature.
-# Residual is computed from Margin + MARKET_SPREAD before dropping.
-# "Residual" must also be dropped since it's the target (not in original DROP_COLUMNS_ML).
-DROP_COLUMNS_MARGIN = list(DROP_COLUMNS_ML) + ["Residual"]
+# Extend margin drop list with the target itself (not in config drop list).
+# MARKET_SPREAD is also kept out of features (used only for residual computation).
+_DROP_COLUMNS_MARGIN = list(DROP_COLUMNS_MARGIN) + ["Residual"]
 
 # Time-decay: λ^(days_ago). 0.9985 ≈ 0.95 at 1 season, 0.58 at 5 seasons.
 DECAY_LAMBDA = 0.9985
@@ -80,9 +81,29 @@ W_CAT = 0.40
 SIGMA_BUCKET_EDGES = [2.0, 5.0, 8.0, 12.0, float("inf")]
 
 
+def _load_optuna_params():
+    """Load Optuna-tuned params if available."""
+    optuna_path = NBA_MARGIN_MODELS_DIR / "optuna_best_params.json"
+    if not optuna_path.exists():
+        return None, None, None
+    try:
+        with open(optuna_path) as f:
+            data = json.load(f)
+        return data.get("xgb_params"), data.get("cat_params"), data.get("weights")
+    except Exception as e:
+        logger.warning("Error loading Optuna params: %s", e)
+        return None, None, None
+
+
 def load_and_prepare(dataset_name):
     with sqlite3.connect(DATASET_DB) as con:
+        # Try requested dataset; fall back to base if not found
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if dataset_name not in tables:
+            logger.warning("Dataset '%s' not found. Using fallback '%s'. Run build_margin_features.py first.", dataset_name, FALLBACK_DATASET)
+            dataset_name = FALLBACK_DATASET
         df = pd.read_sql_query(f'SELECT * FROM "{dataset_name}"', con)
+        logger.info("Loaded dataset '%s': %d rows, %d columns", dataset_name, len(df), len(df.columns))
 
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
@@ -113,7 +134,7 @@ def load_and_prepare(dataset_name):
 
 def df_to_xy(df):
     y = df[TARGET].astype(float).to_numpy()
-    X_df = df.drop(columns=DROP_COLUMNS_MARGIN, errors="ignore")
+    X_df = df.drop(columns=_DROP_COLUMNS_MARGIN, errors="ignore")
     feature_cols = list(X_df.columns)
     X = X_df.replace([np.inf, -np.inf], np.nan)
     X = X.fillna(X.median(numeric_only=True)).fillna(0).to_numpy(dtype=float)
@@ -189,11 +210,15 @@ def _walk_forward_cv(X, y, sample_weights, n_splits=5):
 def main():
     parser = argparse.ArgumentParser(description="Train XGBoost + CatBoost Residual Regression (Camino B)")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument("--no-optuna", action="store_true", help="Ignore Optuna params, use defaults")
     args = parser.parse_args()
 
     print(f"\n{'='*65}")
     print(f"  TRAIN XGBoost + CatBoost — Spread Residual (Camino B)")
     print(f"{'='*65}")
+
+    # Load Optuna-tuned params if available
+    optuna_xgb, optuna_cat, optuna_weights = (None, None, None) if args.no_optuna else _load_optuna_params()
 
     df = load_and_prepare(args.dataset)
 
@@ -223,18 +248,40 @@ def main():
     print(f"  Residual stats — test:  μ={y_test.mean():.2f} σ={y_test.std():.1f}")
     print(f"  Time-decay: λ={DECAY_LAMBDA}, oldest weight={train_weights.min():.3f}")
 
+    # --- Resolve hyperparams (Optuna overrides defaults) ---
+    xgb_params = dict(XGB_PARAMS)
+    xgb_nb = XGB_NB
+    cat_params = dict(CATBOOST_PARAMS)
+    w_xgb, w_cat = W_XGB, W_CAT
+
+    if optuna_xgb:
+        print(f"\n  Using Optuna-tuned XGBoost params")
+        xgb_nb = optuna_xgb.pop("num_boost_round", XGB_NB)
+        hs = optuna_xgb.pop("huber_slope", 10.0)
+        xgb_params.update(optuna_xgb)
+        xgb_params["huber_slope"] = hs
+    if optuna_cat:
+        print(f"  Using Optuna-tuned CatBoost params")
+        hd = optuna_cat.pop("huber_delta", 10.0)
+        cat_params.update(optuna_cat)
+        cat_params["loss_function"] = f"Huber:delta={hd:.1f}"
+    if optuna_weights:
+        w_xgb = optuna_weights.get("xgb", W_XGB)
+        w_cat = optuna_weights.get("cat", W_CAT)
+        print(f"  Using Optuna-tuned weights: XGB={w_xgb:.0%} / Cat={w_cat:.0%}")
+
     # --- 0. Walk-forward CV (reporting only) ---
     print(f"\n  Walk-forward CV (5 folds, XGBoost only)...")
     wf_rmse = _walk_forward_cv(X_train, y_train, train_weights)
 
     # --- 1. Train XGBoost ---
-    print(f"\n  Training XGBoost Regression (nb={XGB_NB}, Huber δ=10)...")
+    print(f"\n  Training XGBoost Regression (nb={xgb_nb}, Huber δ={xgb_params.get('huber_slope', 10)})...")
     dtrain = xgb.DMatrix(X_train, label=y_train, weight=train_weights)
     dtest = xgb.DMatrix(X_test, label=y_test)
 
     booster = xgb.train(
-        XGB_PARAMS, dtrain,
-        num_boost_round=XGB_NB,
+        xgb_params, dtrain,
+        num_boost_round=xgb_nb,
         evals=[(dtest, "test")],
         early_stopping_rounds=60,
         verbose_eval=False,
@@ -245,8 +292,8 @@ def main():
     print(f"  XGBoost — MAE: {xgb_mae:.2f}, RMSE: {xgb_rmse:.2f}")
 
     # --- 2. Train CatBoost ---
-    print(f"\n  Training CatBoost Regression (it={CATBOOST_PARAMS['iterations']}, Huber δ=10)...")
-    cat_model = CatBoostRegressor(**CATBOOST_PARAMS)
+    print(f"\n  Training CatBoost Regression (it={cat_params['iterations']}, Huber)...")
+    cat_model = CatBoostRegressor(**cat_params)
     cat_model.fit(
         X_train, y_train,
         sample_weight=train_weights,
@@ -260,15 +307,44 @@ def main():
     print(f"  CatBoost — MAE: {cat_mae:.2f}, RMSE: {cat_rmse:.2f}")
 
     # --- 3. Ensemble ---
-    p_ensemble = W_XGB * p_xgb + W_CAT * p_cat
+    p_ensemble = w_xgb * p_xgb + w_cat * p_cat
     ens_mae = mean_absolute_error(y_test, p_ensemble)
     ens_rmse = float(np.sqrt(mean_squared_error(y_test, p_ensemble)))
     ats_acc = compute_ats_accuracy(y_test, p_ensemble)
-    print(f"\n  Ensemble (XGB {W_XGB:.0%} + Cat {W_CAT:.0%})")
+    print(f"\n  Ensemble (XGB {w_xgb:.0%} + Cat {w_cat:.0%})")
     print(f"    MAE: {ens_mae:.2f}, RMSE: {ens_rmse:.2f}")
     print(f"    ATS Accuracy: {ats_acc:.1%}")
 
-    # --- 4. Sigma buckets ---
+    # --- 4. Quantile regression (Q10 / Q90) for uncertainty estimation ---
+    print(f"\n  Training XGBoost Quantile Q10 / Q90...")
+    q10_params = dict(xgb_params)
+    q10_params.update({"objective": "reg:quantileerror", "quantile_alpha": 0.10})
+    q10_params.pop("huber_slope", None)
+
+    q90_params = dict(xgb_params)
+    q90_params.update({"objective": "reg:quantileerror", "quantile_alpha": 0.90})
+    q90_params.pop("huber_slope", None)
+
+    bst_q10 = xgb.train(q10_params, dtrain, num_boost_round=xgb_nb,
+                         evals=[(dtest, "test")], early_stopping_rounds=60, verbose_eval=False)
+    bst_q90 = xgb.train(q90_params, dtrain, num_boost_round=xgb_nb,
+                         evals=[(dtest, "test")], early_stopping_rounds=60, verbose_eval=False)
+
+    p_q10 = bst_q10.predict(dtest)
+    p_q90 = bst_q90.predict(dtest)
+    interval_widths = p_q90 - p_q10
+    coverage = float(np.mean((y_test >= p_q10) & (y_test <= p_q90)))
+    mean_width = float(np.mean(interval_widths))
+    print(f"  Quantile interval: coverage={coverage:.1%}, mean_width={mean_width:.1f}")
+
+    # Save quantile models
+    q10_name = f"XGBoost_MARGIN_Q10_nb{xgb_nb}"
+    q90_name = f"XGBoost_MARGIN_Q90_nb{xgb_nb}"
+    bst_q10.save_model(str(NBA_MARGIN_MODELS_DIR / f"{q10_name}.json"))
+    bst_q90.save_model(str(NBA_MARGIN_MODELS_DIR / f"{q90_name}.json"))
+    print(f"    Saved: {q10_name}.json + {q90_name}.json")
+
+    # --- 5. Sigma buckets ---
     sigma_buckets = compute_sigma_buckets(y_test, p_ensemble, spreads_test)
     print(f"\n  Sigma by spread bucket:")
     for label, info in sigma_buckets.items():
@@ -276,7 +352,7 @@ def main():
             print(f"    |spread| {label}: σ={info['sigma']:.1f} (n={info['n']})")
     print(f"    Global: σ={sigma_buckets['global']['sigma']:.1f}")
 
-    # --- 5. Save models ---
+    # --- 6. Save models ---
     NBA_MARGIN_MODELS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"\n  Saving models to {NBA_MARGIN_MODELS_DIR}...")
 
@@ -284,9 +360,9 @@ def main():
     xgb_rmse_str = f"{xgb_rmse:.1f}"
     xgb_name = (
         f"XGBoost_{xgb_rmse_str}rmse_MARGIN_"
-        f"md{XGB_PARAMS['max_depth']}_eta{str(XGB_PARAMS['eta']).replace('.','p')}_"
-        f"sub{str(XGB_PARAMS['subsample']).replace('.','p')}_"
-        f"nb{XGB_NB}"
+        f"md{xgb_params['max_depth']}_eta{str(xgb_params['eta']).replace('.','p')}_"
+        f"sub{str(xgb_params['subsample']).replace('.','p')}_"
+        f"nb{xgb_nb}"
     )
     xgb_path = NBA_MARGIN_MODELS_DIR / f"{xgb_name}.json"
     booster.save_model(str(xgb_path))
@@ -296,21 +372,21 @@ def main():
     cat_rmse_str = f"{cat_rmse:.1f}"
     cat_name = (
         f"CatBoost_{cat_rmse_str}rmse_MARGIN_"
-        f"d{CATBOOST_PARAMS['depth']}_lr{str(CATBOOST_PARAMS['learning_rate']).replace('.','p')}_"
-        f"it{CATBOOST_PARAMS['iterations']}"
+        f"d{cat_params['depth']}_lr{str(cat_params['learning_rate']).replace('.','p')}_"
+        f"it{cat_params['iterations']}"
     )
     cat_path = NBA_MARGIN_MODELS_DIR / f"{cat_name}.pkl"
     joblib.dump(cat_model, cat_path)
     print(f"    CatBoost: {cat_path.name}")
 
-    # --- 6. Conformal regression ---
+    # --- 7. Conformal regression ---
     print("\n  Fitting conformal regression...")
     cal_split = int(len(X_train) * 0.8)
     X_cal, y_cal = X_train[cal_split:], y_train[cal_split:]
     dcal = xgb.DMatrix(X_cal)
     p_xgb_cal = booster.predict(dcal)
     p_cat_cal = cat_model.predict(X_cal)
-    p_ens_cal = W_XGB * p_xgb_cal + W_CAT * p_cat_cal
+    p_ens_cal = w_xgb * p_xgb_cal + w_cat * p_cat_cal
 
     conformal = ConformalRegressor(alpha=0.10)
     conformal.fit(p_ens_cal, y_cal)
@@ -318,7 +394,7 @@ def main():
     joblib.dump(conformal, conf_path)
     print(f"    Conformal: {conformal}")
 
-    # --- 7. Sigma buckets + metadata ---
+    # --- 8. Sigma buckets + metadata ---
     meta = {
         "target": "residual",
         "dataset": args.dataset,
@@ -334,10 +410,16 @@ def main():
         "ats_accuracy": ats_acc,
         "walk_forward_rmse": wf_rmse,
         "decay_lambda": DECAY_LAMBDA,
-        "huber_delta": 10.0,
-        "weights": {"xgb": W_XGB, "cat": W_CAT},
+        "huber_delta": xgb_params.get("huber_slope", 10.0),
+        "weights": {"xgb": w_xgb, "cat": w_cat},
         "sigma_buckets": sigma_buckets,
         "conformal_summary": conformal.summary(),
+        "quantile_interval": {
+            "coverage": coverage,
+            "mean_width": mean_width,
+            "q10_model": f"{q10_name}.json",
+            "q90_model": f"{q90_name}.json",
+        },
     }
     meta_path = NBA_MARGIN_MODELS_DIR / "metadata.json"
     with open(meta_path, "w") as f:
@@ -346,6 +428,8 @@ def main():
     print(f"\n{'='*65}")
     print(f"  DONE — Ensemble: MAE={ens_mae:.2f}, RMSE={ens_rmse:.2f}, ATS={ats_acc:.1%}")
     print(f"  Walk-forward RMSE: {wf_rmse:.2f}")
+    print(f"  Quantile interval: coverage={coverage:.1%}, mean_width={mean_width:.1f}pts")
+    print(f"  Features used: {len(feature_cols)} (enriched dataset adds injury/lineup/ESPN)")
     print(f"{'='*65}\n")
 
 

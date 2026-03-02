@@ -115,6 +115,8 @@ BREF_DB = (
     if (_bref_new.exists() and _bref_new.stat().st_size > 1024)
     else TRAINING_DIR / "BRefData.sqlite"
 )
+STATHEAD_DB      = SCRAPERS_DIR / "StatheadData.sqlite"
+BREF_SESSION_DIR = NBA_DIR / ".bref_session"
 
 # --- Archivo de configuracion ---
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
@@ -204,3 +206,56 @@ DROP_COLUMNS_ML = [
     "MISSING_BPM_HOME", "MISSING_BPM_AWAY",
     "AVAIL_DIFF",
 ]
+
+# Features dropped from ML but RETAINED for margin regression.
+# These help predict margin SIZE even if they don't improve W/L accuracy.
+# Injury impacts, star quality, line movement, and lineup depth all affect
+# how large a team wins/loses by, independent of the binary W/L outcome.
+_MARGIN_KEEP = {
+    # Raw net rating — direct predictor of expected margin
+    "Net_Rtg", "Net_Rtg.1",
+    # Injury availability — missing players widen/narrow margins
+    "AVAIL_AWAY", "AVAIL_HOME",
+    "STAR_MISSING_HOME", "STAR_MISSING_AWAY",
+    "N_ROTATION_OUT_HOME", "N_ROTATION_OUT_AWAY",
+    "MISSING_BPM_HOME", "MISSING_BPM_AWAY",
+    "AVAIL_DIFF",
+    # Travel/timezone fatigue — affects margin more than binary W/L
+    "TZ_CHANGE_HOME",
+    # ESPN line movement — captures late injury/lineup info
+    "ESPN_LINE_MOVE", "ESPN_TOTAL_MOVE",
+    "ESPN_OPEN_ML_PROB", "ESPN_BOOK_DISAGREEMENT",
+    # Advanced player metrics — star power predicts blowout probability
+    "ADV_BPM_TOP5_HOME", "ADV_BPM_TOP5_AWAY",
+    "ADV_MAX_BPM_HOME", "ADV_MAX_BPM_AWAY",
+    "ADV_USG_CONCENTRATION_HOME", "ADV_USG_CONCENTRATION_AWAY",
+    "ADV_TS_TEAM_HOME", "ADV_TS_TEAM_AWAY",
+    # On/off net rating — lineup cohesion affects margin magnitude
+    "ONOFF_NET_TOP5_HOME", "ONOFF_NET_TOP5_AWAY",
+    "ONOFF_SPREAD_HOME", "ONOFF_SPREAD_AWAY",
+    # Line score patterns — Q4/late-game scoring predicts final margin
+    "LS_Q4_PCT_HOME", "LS_Q4_PCT_AWAY",
+    "LS_2H_RATIO_HOME", "LS_2H_RATIO_AWAY",
+    "LS_Q1_PCT_HOME", "LS_Q1_PCT_AWAY",
+    "LS_SCORING_VAR_HOME", "LS_SCORING_VAR_AWAY",
+    # Lineup/bench depth — depth matters in blowouts
+    "LINEUP_DIVERSITY_HOME", "LINEUP_DIVERSITY_AWAY",
+    "LINEUP_STAR_FRAC_HOME", "LINEUP_STAR_FRAC_AWAY",
+    "BENCH_PPG_GAP_HOME", "BENCH_PPG_GAP_AWAY",
+    "BENCH_DEPTH_HOME", "BENCH_DEPTH_AWAY",
+    # Strength of schedule — SRS predicts expected margin vs opponent quality
+    "SRS_AWAY", "SRS_DIFF",
+    "ORB_PCT.1",
+    # Shot chart — paint/RA efficiency predicts margin via high-percentage scoring
+    "SC_RA_RATE_HOME", "SC_RA_RATE_AWAY",
+    "SC_RA_FG_PCT_HOME", "SC_RA_FG_PCT_AWAY",
+    "SC_PAINT_RATE_HOME", "SC_PAINT_RATE_AWAY",
+    "ZONE_AVG_DIST_HOME", "ZONE_FG3A_RATE_HOME",
+    "ZONE_PAINT_FG_PCT_HOME", "ZONE_CLOSE_MID_FG_PCT_HOME",
+    "ZONE_AVG_DIST_AWAY", "ZONE_FG3A_RATE_AWAY",
+    "ZONE_PAINT_FG_PCT_AWAY", "ZONE_CLOSE_MID_FG_PCT_AWAY",
+}
+
+# Drop list for margin regression: same as ML but retains margin-specific signals.
+# "Residual" and "MARKET_SPREAD" handled separately in train_margin_models.py.
+DROP_COLUMNS_MARGIN = [c for c in DROP_COLUMNS_ML if c not in _MARGIN_KEEP]
