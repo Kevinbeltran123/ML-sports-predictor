@@ -181,6 +181,11 @@ class BetTracker:
                 # Margin regression columns
                 ("reg_margin", "REAL"), ("reg_p_cover_home", "REAL"),
                 ("reg_sigma", "REAL"),
+                # ATS tracking (populated by update_results.py)
+                ("ah_actual_cover", "INTEGER"),   # 1=home covered, 0=away covered, NULL=push
+                ("ah_residual", "REAL"),           # Margin + MARKET_SPREAD (positive=home covers)
+                ("ah_game_sigma", "REAL"),         # game-specific sigma from Q10/Q90
+                ("ah_tag", "TEXT"),                # AH-BET / AH-SKIP / AH-PASS
                 # League column (NBA/WNBA)
                 ("league", "TEXT DEFAULT 'NBA'"),
             ]
@@ -236,7 +241,8 @@ class BetTracker:
                         ah_ev_home, ah_ev_away,
                         ah_kelly_home, ah_kelly_away,
                         ah_expected_margin,
-                        reg_margin, reg_p_cover_home, reg_sigma
+                        reg_margin, reg_p_cover_home, reg_sigma,
+                        ah_game_sigma, ah_tag
                     ) VALUES (
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
@@ -250,7 +256,8 @@ class BetTracker:
                         ?, ?,
                         ?, ?,
                         ?,
-                        ?, ?, ?
+                        ?, ?, ?,
+                        ?, ?
                     )
                 """, (
                     game_date, timestamp, p["home_team"], p["away_team"], sportsbook,
@@ -268,6 +275,7 @@ class BetTracker:
                     p.get("ah_kelly_home"), p.get("ah_kelly_away"),
                     p.get("ah_expected_margin"),
                     p.get("reg_margin"), p.get("reg_p_cover_home"), p.get("reg_sigma"),
+                    p.get("ah_game_sigma"), p.get("ah_tag"),
                 ))
             con.commit()
 
@@ -341,6 +349,15 @@ class BetTracker:
                 ml_correct = 1 if ml_predicted_winner == result["winner"] else 0
                 ou_correct = 1 if ou_predicted == actual_ou else 0
 
+                # AH tracking: compute actual margin residual
+                spread_row = con.execute(
+                    "SELECT spread FROM predictions WHERE id = ?", (pred_id,)
+                ).fetchone()
+                ah_margin = result["home_score"] - result["away_score"]
+                ah_spread = float(spread_row[0]) if spread_row and spread_row[0] is not None else 0.0
+                ah_residual = ah_margin + ah_spread
+                ah_actual_cover = 1 if ah_residual > 0 else (None if ah_residual == 0 else 0)
+
                 con.execute("""
                     UPDATE predictions SET
                         actual_home_score = ?,
@@ -349,12 +366,15 @@ class BetTracker:
                         actual_winner = ?,
                         actual_ou = ?,
                         ml_correct = ?,
-                        ou_correct = ?
+                        ou_correct = ?,
+                        ah_actual_cover = ?,
+                        ah_residual = ?
                     WHERE id = ?
                 """, (
                     result["home_score"], result["away_score"], result["total"],
                     result["winner"], actual_ou,
                     ml_correct, ou_correct,
+                    ah_actual_cover, ah_residual,
                     pred_id,
                 ))
                 updated += 1

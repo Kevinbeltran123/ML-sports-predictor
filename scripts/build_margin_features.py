@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import DATASET_DB, get_logger
+from src.sports.nba.features.ats_features import build_ats_lookup, add_ats_to_frame
 
 logger = get_logger(__name__)
 
@@ -129,6 +130,20 @@ def build_enriched_dataset(source_table: str, target_table: str) -> None:
         df = pd.read_sql_query(f'SELECT * FROM "{source_table}"', con)
 
     print(f"  Loaded {len(df):,} rows, {len(df.columns)} columns")
+
+    # Add ATS features if not already present in the base dataset
+    if "ATS_RATE_HOME" not in df.columns:
+        print("  Adding ATS features (rolling 20-game cover rate + streak)...")
+        ats_lookup = build_ats_lookup()
+        if ats_lookup:
+            df = add_ats_to_frame(df, ats_lookup)
+            print(f"  ATS features added: {len(ats_lookup)} teams")
+        else:
+            print("  ATS: no data found, using defaults")
+            for col in ["ATS_RATE_HOME", "ATS_RATE_AWAY"]:
+                df[col] = 0.5
+            for col in ["ATS_STREAK_HOME", "ATS_STREAK_AWAY"]:
+                df[col] = 0.0
 
     df = add_margin_interactions(df)
 

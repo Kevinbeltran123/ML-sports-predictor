@@ -200,6 +200,8 @@ DROP_COLUMNS_ML = [
     "BENCH_DEPTH_HOME", "BENCH_DEPTH_AWAY",
     # --- Referee features (sin datos de entrenamiento) ---
     "REF_CREW_TOTAL_TENDENCY", "REF_CREW_OVER_PCT", "REF_CREW_HOME_WIN_PCT",
+    # --- ATS features (para margin model, no ML moneyline) ---
+    "ATS_RATE_HOME", "ATS_RATE_AWAY", "ATS_STREAK_HOME", "ATS_STREAK_AWAY",
     # --- Injury granulares (ablacion Feb-2026): -1.3pp ---
     "STAR_MISSING_HOME", "STAR_MISSING_AWAY",
     "N_ROTATION_OUT_HOME", "N_ROTATION_OUT_AWAY",
@@ -246,6 +248,8 @@ _MARGIN_KEEP = {
     # Strength of schedule — SRS predicts expected margin vs opponent quality
     "SRS_AWAY", "SRS_DIFF",
     "ORB_PCT.1",
+    # ATS rolling features — teams that cover/fail consistently
+    "ATS_RATE_HOME", "ATS_RATE_AWAY", "ATS_STREAK_HOME", "ATS_STREAK_AWAY",
     # Shot chart — paint/RA efficiency predicts margin via high-percentage scoring
     "SC_RA_RATE_HOME", "SC_RA_RATE_AWAY",
     "SC_RA_FG_PCT_HOME", "SC_RA_FG_PCT_AWAY",

@@ -93,6 +93,10 @@ from src.sports.nba.features.player_advanced_features import (
     add_player_advanced_to_frame,
 )
 from src.sports.nba.features.odds_features import compute_vig_magnitude
+from src.sports.nba.features.ats_features import (
+    build_ats_lookup,
+    add_ats_to_frame,
+)
 from src.sports.nba.features.espn_lines_features import (
     build_espn_consensus_history,
     build_espn_book_disagreement_history,
@@ -393,6 +397,11 @@ def main():
         # LINEUP_DIVERSITY, LINEUP_STAR_FRAC, BENCH_PPG_GAP, BENCH_DEPTH por equipo (rolling 10 T-1)
         lineup_comp_lookup = build_lineup_history()
         logger.info("Lineup Composition: %d entradas (fecha, equipo)", len(lineup_comp_lookup))
+
+        # Pre-construir ATS (Against The Spread) lookup por equipo
+        # ATS_RATE: rolling 20-game cover rate, ATS_STREAK: racha actual
+        ats_lookup = build_ats_lookup()
+        logger.info("ATS: %d equipos con historial", len(ats_lookup))
 
         for season_key in config["create-games"].keys():
             logger.info("Processing season: %s", season_key)
@@ -738,6 +747,10 @@ def main():
     # Agregar Lineup Composition: archetype diversity + bench depth (BRefData, Phase 5)
     # LINEUP_DIVERSITY, LINEUP_STAR_FRAC, BENCH_PPG_GAP, BENCH_DEPTH (x2 home/away)
     frame = add_lineup_composition_to_frame(frame, lineup_comp_features_list)
+
+    # Agregar ATS features: rolling 20-game cover rate + streak por equipo (OddsData)
+    # ATS_RATE_HOME/AWAY, ATS_STREAK_HOME/AWAY (shift 1, sin leakage)
+    frame = add_ats_to_frame(frame, ats_lookup)
 
     # Eliminar duplicados (EDA encontró 2: Lakers 2020-12-27, Suns 2026-02-09)
     n_before = len(frame)

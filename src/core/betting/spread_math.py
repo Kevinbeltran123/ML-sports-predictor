@@ -49,6 +49,16 @@ _SIGMA_BUCKETS = [
 # Fallback global (media ponderada de los buckets)
 NBA_MARGIN_SIGMA = 14.3
 
+# Empirical P(|margin| = N) from 17,162 NBA games (2012-2026).
+# Used for discrete push correction on whole-number lines.
+# Key numbers (3, 7) show highest clustering; NBA scores are integer.
+_MARGIN_PMF = {
+    1: 0.0403, 2: 0.0520, 3: 0.0558, 4: 0.0558, 5: 0.0597,
+    6: 0.0602, 7: 0.0623, 8: 0.0599, 9: 0.0539, 10: 0.0476,
+    11: 0.0439, 12: 0.0403, 13: 0.0364, 14: 0.0345, 15: 0.0317,
+    16: 0.0303, 17: 0.0241, 18: 0.0219, 19: 0.0201, 20: 0.0193,
+}
+
 # WNBA sigma buckets (lower scoring → lower variance, ~10-12 pts)
 _WNBA_SIGMA_BUCKETS = [
     (2.0, 10.0),
@@ -89,6 +99,48 @@ def _sigma_for_line(line, league="nba"):
         if abs_line <= threshold:
             return sigma
     return fallback
+
+
+def sigma_for_line(line, league="nba"):
+    """Public wrapper de _sigma_for_line para uso externo (comparación/auditoría)."""
+    return _sigma_for_line(line, league)
+
+
+def game_sigma_from_interval(interval_width, line):
+    """Convierte interval_width (Q90-Q10) del modelo quantile a σ por partido.
+
+    El rango intercuantil 80% de una t-Student con df grados de libertad
+    cubre 2 × t⁻¹(0.90, df) × σ. Despejando:
+        σ_game = interval_width / (2 × t⁻¹(0.90, df))
+
+    Clipea a [10, 22] para evitar valores extremos.
+    Fallback al σ por bucket si interval_width no disponible.
+    """
+    if interval_width is None or interval_width <= 0:
+        return _sigma_for_line(line)
+    df = _df_for_line(line)
+    t90 = t_dist.ppf(0.90, df)
+    sigma = interval_width / (2 * t90)
+    return float(np.clip(sigma, 10.0, 22.0))
+
+
+def p_push_for_line(line):
+    """Empirical push probability for a whole-number line.
+
+    NBA scores are integers, so whole-number spreads (e.g., -7.0) have
+    non-zero push probability when margin lands exactly on that number.
+    Half-point lines (e.g., -7.5) never push.
+
+    Returns:
+        P(push) from empirical data, or 0.0 for half-point/quarter lines.
+    """
+    frac = abs(line) % 1
+    if frac > 0.01:  # half-point or quarter line → no push
+        return 0.0
+    n = int(abs(line))
+    if n == 0:
+        return 0.0
+    return _MARGIN_PMF.get(n, 0.015)  # fallback ~1.5% for margins > 20
 
 
 def p_cover(p_win, line, sigma=None, distribution="t"):
@@ -178,13 +230,36 @@ def ah_probabilities(p_win, line, sigma=None):
           is_quarter: si es quarter line
     """
     if not is_quarter_line(line):
-        # Full line: binario
+        # Full line — check for push on whole-number lines
         pc = p_cover(p_win, line, sigma)
+        p_push = p_push_for_line(line)
+        if p_push > 0:
+            # Discrete correction: the continuous model spreads the push mass
+            # equally into win/loss. Re-allocate it explicitly.
+            # P(win) = P_cont(cover) - p_push/2, P(loss) = 1 - P_cont(cover) - p_push/2
+            p_win_adj = max(0.01, pc - p_push / 2)
+            p_loss_adj = max(0.01, 1.0 - pc - p_push / 2)
+            # Renormalize to sum to 1
+            total = p_win_adj + p_push + p_loss_adj
+            p_win_adj /= total
+            p_push /= total
+            p_loss_adj /= total
+            return {
+                "p_full_win": p_win_adj,
+                "p_half_win": 0.0,
+                "p_half_loss": 0.0,
+                "p_full_loss": p_loss_adj,
+                "p_push": p_push,
+                "line_near": line,
+                "line_far": line,
+                "is_quarter": False,
+            }
         return {
             "p_full_win": pc,
             "p_half_win": 0.0,
             "p_half_loss": 0.0,
             "p_full_loss": 1.0 - pc,
+            "p_push": 0.0,
             "line_near": line,
             "line_far": line,
             "is_quarter": False,
@@ -313,6 +388,7 @@ def ah_probabilities(p_win, line, sigma=None):
             "p_half_win": 0.0,
             "p_half_loss": p_half,
             "p_full_loss": p_full_loss,
+            "p_push": 0.0,
             "line_near": line_near,
             "line_far": line_far,
             "is_quarter": True,
@@ -324,6 +400,7 @@ def ah_probabilities(p_win, line, sigma=None):
             "p_half_win": p_half,
             "p_half_loss": 0.0,
             "p_full_loss": p_full_loss,
+            "p_push": 0.0,
             "line_near": line_near,
             "line_far": line_far,
             "is_quarter": True,

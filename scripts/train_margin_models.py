@@ -420,6 +420,7 @@ def main():
             "q10_model": f"{q10_name}.json",
             "q90_model": f"{q90_name}.json",
         },
+        "feature_columns": feature_cols,
     }
     meta_path = NBA_MARGIN_MODELS_DIR / "metadata.json"
     with open(meta_path, "w") as f:

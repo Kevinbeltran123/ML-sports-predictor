@@ -44,7 +44,7 @@ def ah_expected_value(ah_probs, odds):
     """
     # Validar que probabilidades suman ~1
     total = sum(ah_probs.get(k, 0) for k in
-                ["p_full_win", "p_half_win", "p_half_loss", "p_full_loss"])
+                ["p_full_win", "p_half_win", "p_half_loss", "p_full_loss", "p_push"])
     if abs(total - 1.0) > 0.01:
         import logging
         logging.getLogger(__name__).warning(
@@ -55,6 +55,7 @@ def ah_expected_value(ah_probs, odds):
     ev = (
         ah_probs["p_full_win"] * win_amount
         + ah_probs["p_half_win"] * (win_amount / 2)
+        + ah_probs.get("p_push", 0.0) * 0  # push = money back, EV=0
         + ah_probs["p_half_loss"] * (-50)
         + ah_probs["p_full_loss"] * (-100)
     )

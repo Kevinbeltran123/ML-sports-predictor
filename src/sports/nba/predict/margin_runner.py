@@ -159,7 +159,7 @@ def is_residual_model():
     return _is_residual
 
 
-def predict_margins(data):
+def predict_margins(data, feature_names=None):
     """Predice margen o residual para cada juego usando ensemble.
 
     If is_residual_model() → returns residuals (Margin + MARKET_SPREAD).
@@ -168,6 +168,8 @@ def predict_margins(data):
 
     Args:
         data: numpy array (N, num_features), mismas features que el clasificador.
+        feature_names: list of feature names matching data columns (optional).
+            Used to reorder columns to match training feature order for CatBoost.
 
     Returns:
         numpy array (N,) con prediccion. None si no hay modelo.
@@ -179,8 +181,25 @@ def predict_margins(data):
     p_xgb = _xgb_margin.predict(dmatrix)
 
     if _cat_margin is not None:
-        p_cat = _cat_margin.predict(data)
-        return W_XGB * p_xgb + W_CAT * p_cat
+        try:
+            cat_data = data
+            # Reorder columns to match training feature order if possible
+            if _feature_columns and feature_names:
+                import pandas as pd
+                df_tmp = pd.DataFrame(data, columns=feature_names)
+                # Only use columns that exist in both
+                common = [c for c in _feature_columns if c in df_tmp.columns]
+                if len(common) >= len(_feature_columns) * 0.9:
+                    cat_data = df_tmp[_feature_columns].fillna(0).to_numpy(dtype=float)
+                else:
+                    logger.warning("Feature overlap too low (%d/%d) — using XGB only",
+                                   len(common), len(_feature_columns))
+                    return p_xgb
+            p_cat = _cat_margin.predict(cat_data)
+            return W_XGB * p_xgb + W_CAT * p_cat
+        except Exception as e:
+            logger.warning("CatBoost margin predict failed: %s — using XGB only", e)
+            return p_xgb
     else:
         return p_xgb
 

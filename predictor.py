@@ -79,6 +79,10 @@ from src.sports.nba.features.bref_game_features import (
     get_game_four_factors,
     add_four_factors_to_frame,
 )
+from src.sports.nba.features.ats_features import (
+    build_ats_lookup,
+    get_game_ats_features,
+)
 from src.core.tools import (
     create_todays_games_from_odds,
     get_json_data,
@@ -340,7 +344,7 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
                              sos_lookup=None, srs_lookup=None,
                              lineup_lookup=None,
                              ref_assignments=None, ref_history=None,
-                             ff_lookup=None):
+                             ff_lookup=None, ats_lookup=None):
     match_data = []
     todays_games_uo = []
     home_team_odds = []
@@ -361,6 +365,7 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     lineup_features_list = []
     referee_features_list = []
     ff_features_list = []
+    ats_features_list = []
 
     today_str = today.strftime("%Y-%m-%d")
 
@@ -511,6 +516,10 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
                 "FF_FT_FGA_HOME": 0.20, "FF_FT_FGA_AWAY": 0.20,
             })
 
+        ats_features_list.append(
+            get_game_ats_features(home_team, away_team, today_str, ats_lookup or {})
+        )
+
         match_data.append(stats)
 
     games_data_frame = pd.concat(match_data, ignore_index=True, axis=1).T
@@ -536,6 +545,11 @@ def create_todays_games_data(games, df, odds, schedule_df, today, game_logs,
     games_data_frame = add_lineup_features_to_frame(games_data_frame, lineup_features_list)
     games_data_frame = add_referee_features_to_frame(games_data_frame, referee_features_list)
     games_data_frame = add_four_factors_to_frame(games_data_frame, ff_features_list)
+
+    # ATS features: rolling 20-game ATS cover rate + streak per team
+    from src.sports.nba.features.ats_features import ATS_FEATURES
+    for f in ATS_FEATURES:
+        games_data_frame[f] = [row[f] for row in ats_features_list]
 
     data, frame_ml, market_info, data_margin = _prepare_prediction_matrix(games_data_frame)
 
@@ -587,7 +601,7 @@ def resolve_games(odds, sportsbook):
 
 def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, args,
                odds=None, market_info=None, spread_home_odds=None, spread_away_odds=None,
-               data_margin=None):
+               data_margin=None, ats_lookup=None):
     predictions = None
     use_ensemble = args.ensemble or (args.odds and not args.xgb)
     use_kelly = args.kelly or use_ensemble  # kelly always on with ensemble
@@ -601,6 +615,7 @@ def run_models(data, todays_games_uo, frame_ml, games, home_team_odds, away_team
             spread_away_odds=spread_away_odds,
             sportsbook=args.odds,
             data_margin=data_margin,
+            ats_lookup=ats_lookup,
         )
         print("-------------------------------------------------------")
     if args.xgb:
@@ -668,6 +683,9 @@ def build_all_lookups(games):
 
     ff_lookup = build_four_factors_history()
 
+    ats_lookup = build_ats_lookup()
+    logger.info("ATS: %d equipos con historial", len(ats_lookup))
+
     return {
         "game_logs": game_logs,
         "elo_ratings": elo_ratings,
@@ -681,6 +699,7 @@ def build_all_lookups(games):
         "ref_assignments": ref_assignments,
         "ref_history": ref_history,
         "ff_lookup": ff_lookup,
+        "ats_lookup": ats_lookup,
     }
 
 
@@ -709,7 +728,7 @@ def main(args, odds_cache=None):
         travel_schedule=lookups["travel_schedule"], sos_lookup=lookups["sos_lookup"],
         srs_lookup=lookups["srs_lookup"], lineup_lookup=lookups["lineup_lookup"],
         ref_assignments=lookups["ref_assignments"], ref_history=lookups["ref_history"],
-        ff_lookup=lookups["ff_lookup"],
+        ff_lookup=lookups["ff_lookup"], ats_lookup=lookups["ats_lookup"],
     )
 
     predictions = run_models(
@@ -725,6 +744,7 @@ def main(args, odds_cache=None):
         spread_home_odds=spread_home_odds,
         spread_away_odds=spread_away_odds,
         data_margin=data_margin,
+        ats_lookup=lookups.get("ats_lookup"),
     )
 
     # --- Save predictions + opening lines ---
