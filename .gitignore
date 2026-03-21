@@ -1,4 +1,37 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
 .env
+
+# Data (large SQLite databases)
 *.sqlite
+data/
+
+# Models (binary, large)
+models/
+*.pkl
+*.joblib
+
+# CatBoost training artifacts
+catboost_info/
+
+# Claude Code instructions (contains server IPs, internal notes)
+CLAUDE.md
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Optuna
+*.db
+optuna_*.log
